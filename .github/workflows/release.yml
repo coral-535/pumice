@@ -1,172 +1,33 @@
-name: Release GitHub npm package
+name: Release
 
 on:
   push:
     tags:
-      - "v*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: Package version to publish
-        required: true
-        default: "0.0.1-alpha"
+      - "v[0-9]*"
 
 permissions:
-  contents: read
+  contents: write
+  packages: write
 
 concurrency:
-  group: release-${{ github.ref }}-${{ inputs.version }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  metadata:
+  release:
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.release.outputs.version }}
-      git_tag: ${{ steps.release.outputs.git_tag }}
-      npm_tag: ${{ steps.release.outputs.npm_tag }}
-      prerelease: ${{ steps.release.outputs.prerelease }}
 
     steps:
       - name: Check out source
         uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
 
-      - name: Require main branch
-        shell: bash
-        run: |
-          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
-            if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
-              echo "Manual releases must be dispatched from main, not $GITHUB_REF." >&2
-              exit 1
-            fi
-          elif ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
-            echo "Tag $GITHUB_REF_NAME does not point to a commit on main." >&2
-            exit 1
-          fi
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
 
       - name: Set up Node
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          package-manager-cache: false
-
-      - name: Resolve and validate version
-        id: release
-        shell: bash
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            version="${GITHUB_REF_NAME#v}"
-          else
-            version="$INPUT_VERSION"
-          fi
-
-          package_version="$(node -p "require('./package.json').version")"
-          if [[ "$version" != "$package_version" ]]; then
-            echo "Release version $version does not match package.json version $package_version" >&2
-            exit 1
-          fi
-
-          if [[ "$version" == *-* ]]; then
-            npm_tag="${version#*-}"
-            npm_tag="${npm_tag%%.*}"
-            prerelease=true
-          else
-            npm_tag=latest
-            prerelease=false
-          fi
-
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "git_tag=v$version" >> "$GITHUB_OUTPUT"
-          echo "npm_tag=$npm_tag" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
-
-  test:
-    needs: metadata
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v6
-
-      - name: Set up Go from go.mod
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-
-      - name: Test
-        run: go test -race ./...
-
-      - name: Vet
-        run: go vet ./...
-
-  build:
-    needs:
-      - metadata
-      - test
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-            npm_arch: x64
-          - goos: linux
-            goarch: arm64
-            npm_arch: arm64
-          - goos: darwin
-            goarch: amd64
-            npm_arch: x64
-          - goos: darwin
-            goarch: arm64
-            npm_arch: arm64
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v6
-
-      - name: Set up Go from go.mod
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-
-      - name: Build
-        env:
-          CGO_ENABLED: "0"
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          VERSION: ${{ needs.metadata.outputs.version }}
-          OUTPUT: pum-${{ matrix.goos }}-${{ matrix.npm_arch }}
-        run: go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "$OUTPUT" .
-
-      - name: Upload binary
-        uses: actions/upload-artifact@v4
-        with:
-          name: pum-${{ matrix.goos }}-${{ matrix.npm_arch }}
-          path: pum-${{ matrix.goos }}-${{ matrix.npm_arch }}
-          if-no-files-found: error
-          retention-days: 7
-
-  publish:
-    needs:
-      - metadata
-      - build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: write
-
-    steps:
-      - name: Check out source
-        uses: actions/checkout@v6
-
-      - name: Set up Node for GitHub Packages
         uses: actions/setup-node@v6
         with:
           node-version: "24"
@@ -174,33 +35,41 @@ jobs:
           scope: "@coral-535"
           package-manager-cache: false
 
-      - name: Download release binaries
-        uses: actions/download-artifact@v5
-        with:
-          pattern: pum-*
-          path: bin
-          merge-multiple: true
+      - name: Set version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          npm version "$version" --no-git-tag-version --allow-same-version
+          echo "VERSION=$version" >> "$GITHUB_ENV"
 
-      - name: Prepare release binaries
-        run: chmod +x bin/pum-*
+      - name: Test
+        run: |
+          go test -race ./...
+          go vet ./...
 
-      - name: Verify npm package
-        run: npm pack --dry-run
+      - name: Build
+        run: |
+          mkdir bin
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            if [[ "$goarch" == "amd64" ]]; then
+              npm_arch=x64
+            else
+              npm_arch=arm64
+            fi
 
-      - name: Publish to GitHub Packages
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -trimpath -ldflags="-s -w -X main.version=$VERSION" \
+              -o "bin/pum-${goos}-${npm_arch}" .
+          done
+          chmod +x bin/pum-*
+
+      - name: Publish package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}
-        run: npm publish --tag "$NPM_TAG"
+        run: npm publish
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ needs.metadata.outputs.git_tag }}
-          IS_PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
-        run: |
-          args=("$RELEASE_TAG" --target "$GITHUB_SHA" --generate-notes bin/pum-*)
-          if [[ "$IS_PRERELEASE" == "true" ]]; then
-            args+=(--prerelease)
-          fi
-          gh release create "${args[@]}"
+        run: gh release create "$GITHUB_REF_NAME" bin/pum-* --verify-tag --generate-notes
