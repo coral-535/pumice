@@ -58,9 +58,7 @@ Pumice now provides a `pum run <task>` CLI with the V1 behavior described in
 
 ## Verification Performed
 
-The workspace did not have Go installed. A temporary official Go 1.24.5
-toolchain was downloaded and extracted under `/tmp/pumice-go`; it did not
-modify the system installation.
+The workspace uses the installed Go 1.26.5 toolchain.
 
 The following completed successfully:
 

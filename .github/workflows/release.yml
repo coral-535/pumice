@@ -12,35 +12,29 @@ on:
         default: "0.0.1-alpha"
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}-${{ inputs.version }}
   cancel-in-progress: false
 
 jobs:
-  release:
+  metadata:
     runs-on: ubuntu-latest
-    env:
-      GO_VERSION: "1.26.5"
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      git_tag: ${{ steps.release.outputs.git_tag }}
+      npm_tag: ${{ steps.release.outputs.npm_tag }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
 
     steps:
       - name: Check out source
         uses: actions/checkout@v6
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-
-      - name: Set up Node for GitHub Packages
+      - name: Set up Node
         uses: actions/setup-node@v6
         with:
           node-version: "24"
-          registry-url: https://npm.pkg.github.com
-          scope: "@coral-535"
           package-manager-cache: false
 
       - name: Resolve and validate version
@@ -75,28 +69,104 @@ jobs:
           echo "npm_tag=$npm_tag" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go from go.mod
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
       - name: Test
-        run: go test ./...
+        run: go test -race ./...
 
-      - name: Build release binaries
-        shell: bash
+      - name: Vet
+        run: go vet ./...
+
+  build:
+    needs:
+      - metadata
+      - test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            npm_arch: x64
+          - goos: linux
+            goarch: arm64
+            npm_arch: arm64
+          - goos: darwin
+            goarch: amd64
+            npm_arch: x64
+          - goos: darwin
+            goarch: arm64
+            npm_arch: arm64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go from go.mod
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build
         env:
-          VERSION: ${{ steps.release.outputs.version }}
-        run: |
-          mkdir -p bin
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
-            goos="${target%/*}"
-            goarch="${target#*/}"
-            case "$goarch" in
-              amd64) npm_arch=x64 ;;
-              arm64) npm_arch=arm64 ;;
-            esac
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          OUTPUT: pum-${{ matrix.goos }}-${{ matrix.npm_arch }}
+        run: go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "$OUTPUT" .
 
-            output="bin/pum-${goos}-${npm_arch}"
-            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
-              go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o "$output" .
-            chmod +x "$output"
-          done
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pum-${{ matrix.goos }}-${{ matrix.npm_arch }}
+          path: pum-${{ matrix.goos }}-${{ matrix.npm_arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs:
+      - metadata
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node for GitHub Packages
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: https://npm.pkg.github.com
+          scope: "@coral-535"
+          package-manager-cache: false
+
+      - name: Download release binaries
+        uses: actions/download-artifact@v5
+        with:
+          pattern: pum-*
+          path: bin
+          merge-multiple: true
+
+      - name: Prepare release binaries
+        run: chmod +x bin/pum-*
 
       - name: Verify npm package
         run: npm pack --dry-run
@@ -104,16 +174,16 @@ jobs:
       - name: Publish to GitHub Packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TAG: ${{ steps.release.outputs.npm_tag }}
+          NPM_TAG: ${{ needs.metadata.outputs.npm_tag }}
         run: npm publish --tag "$NPM_TAG"
 
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ steps.release.outputs.git_tag }}
-          IS_PRERELEASE: ${{ steps.release.outputs.prerelease }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.git_tag }}
+          IS_PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
         run: |
-          args=("$RELEASE_TAG" --target "$GITHUB_SHA" --generate-notes)
+          args=("$RELEASE_TAG" --target "$GITHUB_SHA" --generate-notes bin/pum-*)
           if [[ "$IS_PRERELEASE" == "true" ]]; then
             args+=(--prerelease)
           fi
