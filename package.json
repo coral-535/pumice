@@ -1,6 +1,6 @@
 {
   "name": "pumice-cli",
-  "version": "0.0.1-alpha",
+  "version": "0.0.2-alpha",
   "description": "Service-aware task runner with shared development services",
   "license": "MIT",
   "repository": {
