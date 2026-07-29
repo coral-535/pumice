@@ -57,7 +57,7 @@ jobs:
 
       - name: Build
         run: |
-          mkdir bin
+          mkdir -p bin
           for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             goos="${target%/*}"
             goarch="${target#*/}"
