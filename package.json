@@ -1,0 +1,30 @@
+{
+  "name": "@coral-535/pumice",
+  "version": "0.0.1-alpha",
+  "description": "Service-aware task runner with shared development services",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/coral-535/pumice.git"
+  },
+  "homepage": "https://github.com/coral-535/pumice#readme",
+  "bugs": {
+    "url": "https://github.com/coral-535/pumice/issues"
+  },
+  "bin": {
+    "pum": "npm/pum.js"
+  },
+  "files": [
+    "bin/",
+    "npm/pum.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://npm.pkg.github.com"
+  }
+}

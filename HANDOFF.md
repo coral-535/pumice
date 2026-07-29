@@ -51,16 +51,14 @@ Pumice now provides a `pum run <task>` CLI with the V1 behavior described in
 - `config_test.go`: configuration and YAML validation tests.
 - `runner_test.go`: temporary-service, shared-service, duplicate-invocation,
   managed-port, lifecycle-output, and shutdown-order tests.
-- `go.mod`: module `github.com/coral-535/pumice`, requiring Go 1.22.
+- `go.mod`: module `github.com/coral-535/pumice`, requiring Go 1.26.5.
 - `go.sum`: checksums for `gopkg.in/yaml.v3` and its transitive module
   metadata.
 - `README.md`: expanded build, configuration, and usage documentation.
 
 ## Verification Performed
 
-The workspace did not have Go installed. A temporary official Go 1.24.5
-toolchain was downloaded and extracted under `/tmp/pumice-go`; it did not
-modify the system installation.
+The workspace uses the installed Go 1.26.5 toolchain.
 
 The following completed successfully:
 
@@ -114,4 +112,4 @@ sandbox, `go test` therefore had to run with elevated sandbox permission.
    shared registry and concurrent runners within one test process.
 3. Consider configurable health-check timeout/interval only if the V1 schema
    should expand beyond `DESIGN.md`.
-4. Run the tests on a normal developer machine with Go 1.22 or newer.
+4. Run the tests on a normal developer machine with Go 1.26.5.
