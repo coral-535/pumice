@@ -30,6 +30,21 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Require main branch
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+              echo "Manual releases must be dispatched from main, not $GITHUB_REF." >&2
+              exit 1
+            fi
+          elif ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Tag $GITHUB_REF_NAME does not point to a commit on main." >&2
+            exit 1
+          fi
 
       - name: Set up Node
         uses: actions/setup-node@v6
@@ -70,6 +85,7 @@ jobs:
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
   test:
+    needs: metadata
     runs-on: ubuntu-latest
 
     steps:
