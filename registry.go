@@ -31,9 +31,9 @@ type runtimeState struct {
 }
 
 type invocation struct {
-	PID       int      `json:"pid"`
-	Label     string   `json:"label"`
-	StartedAt string   `json:"started_at"`
+	PID       int    `json:"pid"`
+	Label     string `json:"label"`
+	StartedAt string `json:"started_at"`
 }
 
 type service struct {
@@ -46,15 +46,26 @@ type service struct {
 
 func newRegistry(worktree string, portNames []string) (*registry, error) {
 	base := os.Getenv("XDG_RUNTIME_DIR")
-	if base == "" {
-		base = filepath.Join(os.TempDir(), "pumice-"+strconv.Itoa(os.Getuid()))
-	} else {
+	if base != "" {
 		base = filepath.Join(base, "pumice")
 	}
+	fallback := filepath.Join(os.TempDir(), "pumice-"+strconv.Itoa(os.Getuid()))
+	if base == "" {
+		base = fallback
+	}
 	sum := sha256.Sum256([]byte(worktree))
-	dir := filepath.Join(base, hex.EncodeToString(sum[:12]))
+	key := hex.EncodeToString(sum[:12])
+	dir := filepath.Join(base, key)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create runtime directory: %w", err)
+		// Sandboxes and containers sometimes advertise a host runtime directory
+		// that is not writable in the current mount namespace.
+		if base == fallback {
+			return nil, fmt.Errorf("create runtime directory: %w", err)
+		}
+		dir = filepath.Join(fallback, key)
+		if fallbackErr := os.MkdirAll(dir, 0o700); fallbackErr != nil {
+			return nil, fmt.Errorf("create runtime directory: %w", fallbackErr)
+		}
 	}
 	return &registry{
 		dir:       dir,

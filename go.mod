@@ -1,4 +1,4 @@
-module github.com/coral-laboratories/pumice
+module github.com/coral-535/pumice
 
 go 1.22
 

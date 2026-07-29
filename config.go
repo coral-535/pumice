@@ -6,24 +6,27 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
+var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 type projectConfig struct {
-	Ports    []string         `yaml:"ports"`
+	Ports    []string          `yaml:"ports"`
 	Tasks    map[string]*entry `yaml:"tasks"`
-	Root     string           `yaml:"-"`
-	Filename string           `yaml:"-"`
+	Root     string            `yaml:"-"`
+	Filename string            `yaml:"-"`
 }
 
 type entry struct {
-	Lifecycle  string   `yaml:"lifecycle"`
-	Command    string   `yaml:"command"`
-	Healthcheck string  `yaml:"healthcheck"`
-	DependsOn  []string `yaml:"depends_on"`
+	Lifecycle   string   `yaml:"lifecycle"`
+	Command     string   `yaml:"command"`
+	Healthcheck string   `yaml:"healthcheck"`
+	DependsOn   []string `yaml:"depends_on"`
 }
 
 func (e *entry) isService() bool {
@@ -100,6 +103,9 @@ func (c *projectConfig) validate() error {
 	for _, port := range c.Ports {
 		if port == "" {
 			return errors.New("port names cannot be empty")
+		}
+		if !environmentName.MatchString(port) {
+			return fmt.Errorf("port %q is not a valid environment variable name", port)
 		}
 		if seenPorts[port] {
 			return fmt.Errorf("port %q is declared more than once", port)

@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -21,21 +20,20 @@ const (
 )
 
 type runner struct {
-	cfg        *projectConfig
-	registry   *registry
-	stdout     io.Writer
-	stderr     io.Writer
-	id         string
-	label      string
-	ports      map[string]string
-	completed  map[string]bool
-	processes  map[string]*managedProcess
+	cfg         *projectConfig
+	registry    *registry
+	stdout      io.Writer
+	stderr      io.Writer
+	id          string
+	label       string
+	ports       map[string]string
+	completed   map[string]bool
 	releaseOnce sync.Once
 }
 
 type managedProcess struct {
-	pid    int
-	done   chan error
+	pid  int
+	done chan error
 }
 
 func newRunner(cfg *projectConfig, stdout, stderr io.Writer) (*runner, error) {
@@ -50,7 +48,6 @@ func newRunner(cfg *projectConfig, stdout, stderr io.Writer) (*runner, error) {
 		stderr:    stderr,
 		id:        fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()),
 		completed: make(map[string]bool),
-		processes: make(map[string]*managedProcess),
 	}, nil
 }
 
@@ -78,6 +75,9 @@ func (r *runner) Run(ctx context.Context, name string) (runErr error) {
 		process, err := r.ensureService(ctx, name, true)
 		if err != nil {
 			return err
+		}
+		if process == nil {
+			return fmt.Errorf("direct service %q has no local process", name)
 		}
 		select {
 		case err := <-process.done:
@@ -148,7 +148,7 @@ func (r *runner) ensureService(ctx context.Context, name string, direct bool) (*
 		if ok {
 			if direct {
 				return fmt.Errorf(
-					"service %q is already running in this worktree\nAttaching to an existing service is not supported",
+					"Service %q is already running in this worktree.\nAttaching to an existing service is not supported.",
 					name,
 				)
 			}
@@ -160,15 +160,22 @@ func (r *runner) ensureService(ctx context.Context, name string, direct bool) (*
 
 		fmt.Fprintf(r.stderr, "Starting %s...\n", name)
 		cmd := r.shellCommand(context.Background(), task.Command)
-		cmd.Stdout = r.stdout
-		cmd.Stderr = r.stderr
-		cmd.Stdin = nil
+		if direct {
+			cmd.Stdout = r.stdout
+			cmd.Stderr = r.stderr
+			cmd.Stdin = os.Stdin
+		} else {
+			// Dependency services can outlive the invocation that launched them.
+			// Do not leave that invocation's output pipe or terminal descriptors
+			// attached indefinitely.
+			cmd.Stdout = io.Discard
+			cmd.Stderr = io.Discard
+		}
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		if err := cmd.Start(); err != nil {
 			return fmt.Errorf("start service %q: %w", name, err)
 		}
 		process = &managedProcess{pid: cmd.Process.Pid, done: make(chan error, 1)}
-		r.processes[name] = process
 		state.Services[name] = &service{
 			PID:       process.pid,
 			Command:   task.Command,
@@ -184,12 +191,15 @@ func (r *runner) ensureService(ctx context.Context, name string, direct bool) (*
 		return nil
 	})
 	if err != nil {
+		if process != nil {
+			stopProcess(process.pid)
+		}
 		return nil, err
 	}
 	if existing {
 		fmt.Fprintf(r.stderr, "Using existing %s service.\n", name)
 		if healthy {
-			return &managedProcess{pid: r.servicePID(name), done: make(chan error)}, nil
+			return nil, nil
 		}
 	} else if direct {
 		// A direct service is always newly started, so its process can be waited on.
@@ -205,7 +215,7 @@ func (r *runner) ensureService(ctx context.Context, name string, direct bool) (*
 		fmt.Fprintf(r.stderr, "%s is healthy.\n", name)
 	}
 	if process == nil {
-		process = &managedProcess{pid: r.servicePID(name), done: make(chan error)}
+		return nil, nil
 	}
 	return process, nil
 }
@@ -269,17 +279,6 @@ func (r *runner) serviceAlive(name string) bool {
 	return alive
 }
 
-func (r *runner) servicePID(name string) int {
-	pid := 0
-	_ = r.registry.withLock(func(state *runtimeState) error {
-		if svc := state.Services[name]; svc != nil {
-			pid = svc.PID
-		}
-		return nil
-	})
-	return pid
-}
-
 func (r *runner) markExited(name string, pid int) {
 	_ = r.registry.withLock(func(state *runtimeState) error {
 		if svc := state.Services[name]; svc != nil && svc.PID == pid {
@@ -294,8 +293,27 @@ func (r *runner) release() error {
 	r.releaseOnce.Do(func() {
 		releaseErr = r.registry.withLock(func(state *runtimeState) error {
 			delete(state.Invocations, r.id)
-			for name, svc := range state.Services {
+			for _, svc := range state.Services {
 				delete(svc.Refs, r.id)
+			}
+			order := r.serviceStopOrder()
+			inOrder := make(map[string]bool, len(order))
+			for _, name := range order {
+				inOrder[name] = true
+			}
+			var unknown []string
+			for name := range state.Services {
+				if !inOrder[name] {
+					unknown = append(unknown, name)
+				}
+			}
+			sort.Strings(unknown)
+			order = append(order, unknown...)
+			for _, name := range order {
+				svc := state.Services[name]
+				if svc == nil {
+					continue
+				}
 				if len(svc.Refs) != 0 {
 					owners := uniqueOwners(svc.Refs)
 					fmt.Fprintf(r.stderr, "%s remains active because it is still required by %s.\n",
@@ -313,6 +331,40 @@ func (r *runner) release() error {
 		})
 	})
 	return releaseErr
+}
+
+func (r *runner) serviceStopOrder() []string {
+	seen := make(map[string]bool)
+	var order []string
+	var visit func(string)
+	visit = func(name string) {
+		if seen[name] {
+			return
+		}
+		seen[name] = true
+		task := r.cfg.Tasks[name]
+		if task == nil {
+			return
+		}
+		for _, dependency := range task.DependsOn {
+			visit(dependency)
+		}
+		if task.isService() {
+			order = append(order, name)
+		}
+	}
+	names := make([]string, 0, len(r.cfg.Tasks))
+	for name := range r.cfg.Tasks {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		visit(name)
+	}
+	for left, right := 0, len(order)-1; left < right; left, right = left+1, right-1 {
+		order[left], order[right] = order[right], order[left]
+	}
+	return order
 }
 
 func uniqueOwners(refs map[string]string) []string {
@@ -334,8 +386,4 @@ func cloneMap(source map[string]string) map[string]string {
 		clone[key] = value
 	}
 	return clone
-}
-
-func (p *managedProcess) String() string {
-	return strconv.Itoa(p.pid)
 }

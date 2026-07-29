@@ -6,7 +6,7 @@ The user asked to implement the service described in `DESIGN.md` in Go. The
 repository initially contained only `README.md`, `DESIGN.md`, `LICENSE`, and
 `.gitignore`.
 
-The implementation is complete and currently uncommitted.
+The implementation is complete.
 
 ## What Was Implemented
 
@@ -52,8 +52,8 @@ Pumice now provides a `pum run <task>` CLI with the V1 behavior described in
 - `runner_test.go`: temporary-service, shared-service, duplicate-invocation,
   managed-port, lifecycle-output, and shutdown-order tests.
 - `go.mod`: module `github.com/coral-535/pumice`, requiring Go 1.22.
-- `vendor/`: vendored `gopkg.in/yaml.v3` v3.0.1 for reproducible offline
-  builds.
+- `go.sum`: checksums for `gopkg.in/yaml.v3` and its transitive module
+  metadata.
 - `README.md`: expanded build, configuration, and usage documentation.
 
 ## Verification Performed
@@ -68,7 +68,6 @@ The following completed successfully:
 go test -race ./...
 go vet ./...
 go build -o /tmp/pum ./
-go list -mod=vendor ./...
 git diff --check
 /tmp/pum --version
 ```
@@ -82,25 +81,6 @@ ok github.com/coral-535/pumice
 The lifecycle tests require permission to bind an ephemeral localhost socket
 because managed ports are allocated with `127.0.0.1:0`. In this particular
 sandbox, `go test` therefore had to run with elevated sandbox permission.
-
-## Current Working Tree
-
-At handoff time, the expected changes are:
-
-```text
- M README.md
-?? HANDOFF.md
-?? config.go
-?? config_test.go
-?? go.mod
-?? main.go
-?? registry.go
-?? runner.go
-?? runner_test.go
-?? vendor/
-```
-
-No commit or pull request has been created.
 
 ## Design Decisions and Caveats
 
@@ -135,4 +115,3 @@ No commit or pull request has been created.
 3. Consider configurable health-check timeout/interval only if the V1 schema
    should expand beyond `DESIGN.md`.
 4. Run the tests on a normal developer machine with Go 1.22 or newer.
-5. Commit the changes when approved.
