@@ -1,30 +1,98 @@
 # Pumice
 
-Run a task from the current Git worktree without installing Pumice globally.
-Pumice reads tasks from `pumice.yaml` or `pumice.yml`.
+Pumice is a task runner for development services. It starts the services a task
+depends on, waits until they are healthy, reuses services that are already
+running in the same Git worktree, and stops them when they are no longer needed.
 
-## pnpx
+Pumice currently supports macOS and Linux on x64 and ARM64.
 
-```sh
-pnpx --package=pumice-cli@alpha pum run <task>
+## Quick start
+
+Add a `pumice.yaml` file to your project:
+
+```yaml
+ports:
+  - DATABASE_PORT
+  - DEV_PORT
+
+tasks:
+  database:
+    lifecycle: service
+    command: my-database --port $DATABASE_PORT
+    healthcheck: database-ready --port $DATABASE_PORT
+
+  dev:
+    lifecycle: service
+    command: pnpm dev --port $DEV_PORT
+    healthcheck: curl --fail http://localhost:$DEV_PORT
+    depends_on:
+      - database
+
+  db:migrate:
+    command: pnpm db:migrate
+    depends_on:
+      - database
 ```
 
-For example:
+Run a task without installing Pumice:
 
 ```sh
 pnpx --package=pumice-cli@alpha pum run dev
-pnpx --package=pumice-cli@alpha pum run db:migrate
 ```
 
-## npx
-
-```sh
-npx --package=pumice-cli@alpha -- pum run <task>
-```
-
-For example:
+Pumice also works with `npx`:
 
 ```sh
 npx --package=pumice-cli@alpha -- pum run dev
-npx --package=pumice-cli@alpha -- pum run db:migrate
 ```
+
+Replace `dev` with any task defined in `pumice.yaml` or `pumice.yml`:
+
+```sh
+pnpx --package=pumice-cli@alpha pum run db:migrate
+```
+
+## Add Pumice to your package scripts
+
+Install Pumice as a development dependency:
+
+```sh
+pnpm add --save-dev pumice-cli@alpha
+```
+
+Or with npm:
+
+```sh
+npm install --save-dev pumice-cli@alpha
+```
+
+Then call the `pum` executable from `package.json`:
+
+```json
+{
+  "scripts": {
+    "dev": "pum run dev",
+    "db:migrate": "pum run db:migrate"
+  }
+}
+```
+
+Run the scripts with your package manager:
+
+```sh
+pnpm dev
+pnpm db:migrate
+```
+
+The equivalent npm commands are `npm run dev` and `npm run db:migrate`.
+
+## Configuration
+
+Pumice searches the current directory and its parents for `pumice.yaml` or
+`pumice.yml`.
+
+- A task runs its `command` and exits.
+- A service uses `lifecycle: service` and must define a `healthcheck`.
+- `depends_on` lists tasks or services that must be ready first.
+- `ports` lists environment variables for worktree-specific ports. Pumice
+  assigns their values and makes them available to commands and health checks.
