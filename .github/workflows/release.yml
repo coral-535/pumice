@@ -7,7 +7,7 @@ on:
 
 permissions:
   contents: write
-  packages: write
+  id-token: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -31,15 +31,23 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: "24"
-          registry-url: https://npm.pkg.github.com
-          scope: "@coral-535"
+          registry-url: https://registry.npmjs.org
           package-manager-cache: false
 
       - name: Set version
         run: |
           version="${GITHUB_REF_NAME#v}"
           npm version "$version" --no-git-tag-version --allow-same-version
+
+          if [[ "$version" == *-* ]]; then
+            prerelease="${version#*-}"
+            npm_tag="${prerelease%%.*}"
+          else
+            npm_tag=latest
+          fi
+
           echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "NPM_TAG=$npm_tag" >> "$GITHUB_ENV"
 
       - name: Test
         run: |
@@ -65,9 +73,7 @@ jobs:
           chmod +x bin/pum-*
 
       - name: Publish package
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npm publish
+        run: npm publish --tag "$NPM_TAG"
 
       - name: Create GitHub release
         env:

@@ -12,19 +12,18 @@ Pumice supports Go 1.26.5, the current stable Go release.
 go build -o pum .
 ```
 
-## Install from GitHub Packages
+## Install
 
-Pumice is published as `@coral-535/pumice` with prebuilt Linux and macOS
-binaries for x64 and ARM64. Configure npm authentication for GitHub Packages,
-then install the alpha release:
+Pumice is published as `pumice-cli` with prebuilt Linux and macOS binaries for
+x64 and ARM64. Install the alpha release with npm or pnpm:
 
 ```sh
-npm install --global @coral-535/pumice@alpha \
-  --registry=https://npm.pkg.github.com
+npm install --global pumice-cli@alpha
+# or
+pnpm add --global pumice-cli@alpha
 ```
 
-The package installs the `pum` command. GitHub Packages requires a personal
-access token with `read:packages` in your npm configuration.
+The package installs the `pum` command.
 
 ## Configuration
 
