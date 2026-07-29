@@ -6,11 +6,25 @@ same Git worktree.
 
 ## Build
 
-Pumice requires Go 1.22 or newer.
+Pumice supports Go 1.26.5, the current stable Go release.
 
 ```sh
 go build -o pum .
 ```
+
+## Install from GitHub Packages
+
+Pumice is published as `@coral-535/pumice` with prebuilt Linux and macOS
+binaries for x64 and ARM64. Configure npm authentication for GitHub Packages,
+then install the alpha release:
+
+```sh
+npm install --global @coral-535/pumice@alpha \
+  --registry=https://npm.pkg.github.com
+```
+
+The package installs the `pum` command. GitHub Packages requires a personal
+access token with `read:packages` in your npm configuration.
 
 ## Configuration
 
