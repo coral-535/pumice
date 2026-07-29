@@ -16,6 +16,7 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    environment: npm
 
     steps:
       - name: Check out source
