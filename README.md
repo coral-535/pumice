@@ -37,19 +37,19 @@ tasks:
 Run a task without installing Pumice:
 
 ```sh
-pnpx --package=pumice-cli pum run dev
+pnpx pumice-cli run dev
 ```
 
 Pumice also works with `npx`:
 
 ```sh
-npx --package=pumice-cli -- pum run dev
+npx pumice-cli run dev
 ```
 
 Replace `dev` with any task defined in `pumice.yaml` or `pumice.yml`:
 
 ```sh
-pnpx --package=pumice-cli pum run db:migrate
+pnpx pumice-cli run db:migrate
 ```
 
 ## Add Pumice to your package scripts

@@ -1,6 +1,6 @@
 {
   "name": "pumice-cli",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Service-aware task runner with shared development services",
   "license": "MIT",
   "repository": {
@@ -12,6 +12,7 @@
     "url": "https://github.com/coral-535/pumice/issues"
   },
   "bin": {
+    "pumice-cli": "npm/pum.js",
     "pum": "npm/pum.js",
     "pum-darwin-arm64": "bin/pum-darwin-arm64",
     "pum-darwin-x64": "bin/pum-darwin-x64",
