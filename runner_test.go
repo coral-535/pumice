@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -292,6 +293,102 @@ func TestDaemonDeathKillsManagedServiceAndDisconnectsClient(t *testing.T) {
 	waitFor(t, 5*time.Second, func() bool {
 		return !testProcessAlive(servicePID)
 	})
+}
+
+func TestDaemonShutsDownPromptlyWhenIdle(t *testing.T) {
+	root := t.TempDir()
+	useIsolatedRuntime(t)
+	cfg := &projectConfig{
+		Root: root,
+		Tasks: map[string]*entry{
+			"brief": {Command: "sleep 0.4"},
+		},
+	}
+	paths, err := newRuntimePaths(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- runDaemonClient(
+			context.Background(),
+			cfg,
+			"brief",
+			strings.NewReader(""),
+			io.Discard,
+			io.Discard,
+		)
+	}()
+	waitFor(t, 3*time.Second, func() bool {
+		return pathExists(paths.pid) && pathExists(paths.socket)
+	})
+	if err := waitResult(t, done); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool {
+		return !pathExists(paths.pid) && !pathExists(paths.socket)
+	})
+}
+
+func TestIncompatibleClientCannotReplaceActiveDaemon(t *testing.T) {
+	root := t.TempDir()
+	useIsolatedRuntime(t)
+	ready := root + "/ready"
+	pidFile := root + "/service.pid"
+	cfg := directServiceConfig(root, "db", ready, pidFile, nil)
+	t.Cleanup(func() { stopTestDaemon(cfg.Root) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	activeDone := make(chan error, 1)
+	go func() {
+		activeDone <- runDaemonClient(
+			ctx,
+			cfg,
+			"db",
+			strings.NewReader(""),
+			io.Discard,
+			io.Discard,
+		)
+	}()
+	waitFor(t, 5*time.Second, func() bool { return pathExists(ready) })
+	servicePID := readPID(t, pidFile)
+
+	conn, err := connectDaemon(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(conn).Encode(clientMessage{
+		Version: protocolVersion + 1,
+		Type:    "run",
+		Name:    "db",
+		Digest:  configDigest(cfg),
+		Config:  cfg,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var event daemonEvent
+	if err := json.NewDecoder(conn).Decode(&event); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	if !strings.Contains(event.Error, "incompatible") {
+		t.Fatalf("protocol mismatch event = %#v", event)
+	}
+	if !testProcessAlive(servicePID) || !pathExists(ready) {
+		t.Fatal("incompatible client disturbed the active daemon or its service")
+	}
+	select {
+	case err := <-activeDone:
+		t.Fatalf("active compatible client exited: %v", err)
+	default:
+	}
+
+	cancel()
+	if err := waitResult(t, activeDone); err == nil || !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("active client cancellation error = %v", err)
+	}
 }
 
 func TestServicesStopInDependentOrder(t *testing.T) {

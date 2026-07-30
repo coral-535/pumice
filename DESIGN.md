@@ -19,6 +19,18 @@ Each canonical Git worktree has one short-lived Pumice daemon. CLI processes
 connect to that daemon over a user-only Unix socket; they never launch or own
 project commands directly.
 
+The daemon namespace and lifetime lock are scoped by canonical worktree, not by
+npm package version. Different repositories therefore cannot collide. Within
+one worktree, all compatible clients use the same daemon; compatibility is
+defined by the IPC protocol version. A breaking daemon/protocol change must
+bump that version. Running parallel daemons for different package versions in
+one worktree is forbidden because it would create two service-lock authorities.
+
+After the last connection and managed service disappear, the daemon exits
+following a 250 ms grace period. Consequently, after an npm package upgrade,
+the next invocation starts the new binary as soon as the previous worktree is
+idle.
+
 The daemon is the single authority for:
 
 * service-name locks and startup state;

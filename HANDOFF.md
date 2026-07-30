@@ -15,8 +15,15 @@ is the sole owner of:
 - managed ports; and
 - every task, service, and health-check process.
 
-The daemon exits after ten idle seconds. A startup flock and a lifetime flock
-prevent daemon startup races.
+The daemon exits 250 ms after its final connection and service disappear. A
+startup flock and a lifetime flock prevent daemon startup races.
+
+Runtime identity is based on the canonical worktree, not the package version.
+This isolates different repositories while ensuring that two npm versions
+cannot create competing lock authorities in one worktree. Compatible package
+versions share the versioned IPC protocol; breaking compatibility requires a
+`protocolVersion` bump. Once a worktree becomes idle, its daemon exits and the
+next CLI invocation launches whichever package binary invoked it.
 
 ## Failure guarantees
 

@@ -18,6 +18,13 @@ task and service processes and is the lock authority for service names.
 - If the daemon is killed, private process leases cause all managed process
   groups to be killed and all connected CLI commands to exit.
 
+Different repositories always use different daemons, even when their npm
+dependencies contain different Pumice versions. Within one worktree, compatible
+package versions share a daemon based on the IPC protocol version; parallel
+version-specific daemons are intentionally prohibited. The daemon shuts down
+250 ms after its final command and service is gone, so the next invocation
+after an upgrade launches the newly installed binary.
+
 Health checks are used only to determine readiness. Process ownership and
 failure detection come from the daemon and operating-system process events.
 

@@ -15,7 +15,10 @@ import (
 	"time"
 )
 
-const daemonIdleTimeout = 10 * time.Second
+// A small grace period absorbs adjacent CLI invocations without leaving an
+// unused background process around. The daemon cannot exit while a connection
+// or managed service is still registered.
+const daemonIdleTimeout = 250 * time.Millisecond
 
 type daemonServer struct {
 	root       string
@@ -88,7 +91,7 @@ func runDaemon(args []string) int {
 		_ = unixListener.Close()
 	}()
 	for {
-		if err := unixListener.SetDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+		if err := unixListener.SetDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 			fmt.Fprintf(os.Stderr, "pum daemon: set accept deadline: %v\n", err)
 			server.shutdown()
 			return 1
@@ -187,7 +190,11 @@ func (s *daemonServer) serveConn(parent context.Context, conn net.Conn) {
 	}
 	writer := &eventWriter{encoder: json.NewEncoder(conn)}
 	if request.Version != protocolVersion {
-		writer.done(fmt.Errorf("unsupported daemon protocol version %d", request.Version))
+		writer.done(fmt.Errorf(
+			"daemon protocol %d is incompatible with client protocol %d; wait for active commands to finish and retry",
+			protocolVersion,
+			request.Version,
+		))
 		return
 	}
 	if request.Type != "run" {
