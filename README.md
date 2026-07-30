@@ -6,6 +6,21 @@ running in the same Git worktree, and stops them when they are no longer needed.
 
 Pumice currently supports macOS and Linux on x64 and ARM64.
 
+## Process safety
+
+Pumice runs one shared, short-lived daemon per Git worktree. The daemon owns all
+task and service processes and is the lock authority for service names.
+
+- Concurrent requests for a stopped dependency share one atomic startup.
+- Locks do not depend on ports; services without a listening port are safe.
+- Closing or killing a CLI immediately releases that invocation's references.
+- If a dependency exits, the daemon stops all transitive dependent services.
+- If the daemon is killed, private process leases cause all managed process
+  groups to be killed and all connected CLI commands to exit.
+
+Health checks are used only to determine readiness. Process ownership and
+failure detection come from the daemon and operating-system process events.
+
 ## Quick start
 
 Add a `pumice.yaml` file to your project:
@@ -96,3 +111,7 @@ Pumice searches the current directory and its parents for `pumice.yaml` or
 - `depends_on` lists tasks or services that must be ready first.
 - `ports` lists environment variables for worktree-specific ports. Pumice
   assigns their values and makes them available to commands and health checks.
+
+The daemon accepts configuration changes only while no commands or services are
+active. This prevents concurrent invocations from using different dependency
+graphs under the same worktree lock.

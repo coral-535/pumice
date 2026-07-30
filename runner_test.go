@@ -3,32 +3,51 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
 
+func TestMain(m *testing.M) {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "_daemon":
+			os.Exit(runDaemon(os.Args[2:]))
+		case "_exec":
+			os.Exit(runExecSupervisor(os.Args[2:]))
+		}
+	}
+	os.Exit(m.Run())
+}
+
 func TestTemporaryServiceLifecycleAndPortInjection(t *testing.T) {
 	root := t.TempDir()
-	ready := filepath.Join(root, "ready")
-	servicePort := filepath.Join(root, "service-port")
-	taskPort := filepath.Join(root, "task-port")
+	useIsolatedRuntime(t)
+	ready := root + "/ready"
+	servicePort := root + "/service-port"
+	taskPort := root + "/task-port"
 	cfg := testConfig(root, ready, servicePort, taskPort)
 
 	var output safeBuffer
-	runner, err := newRunner(cfg, &output, &output)
+	err := runDaemonClient(
+		context.Background(),
+		cfg,
+		"migrate",
+		strings.NewReader(""),
+		&output,
+		&output,
+	)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("runDaemonClient() error = %v\noutput:\n%s", err, output.String())
 	}
-	if err := runner.Run(context.Background(), "migrate"); err != nil {
-		t.Fatalf("Run() error = %v\noutput:\n%s", err, output.String())
-	}
+	t.Cleanup(func() { stopTestDaemon(cfg.Root) })
 
 	serviceValue := strings.TrimSpace(readTestFile(t, servicePort))
 	taskValue := strings.TrimSpace(readTestFile(t, taskPort))
@@ -38,10 +57,7 @@ func TestTemporaryServiceLifecycleAndPortInjection(t *testing.T) {
 	if port, err := strconv.Atoi(serviceValue); err != nil || port <= 0 {
 		t.Fatalf("managed port = %q, want a positive integer", serviceValue)
 	}
-	waitFor(t, 2*time.Second, func() bool {
-		_, err := os.Stat(ready)
-		return os.IsNotExist(err)
-	})
+	waitFor(t, 3*time.Second, func() bool { return !pathExists(ready) })
 
 	log := output.String()
 	for _, message := range []string{
@@ -58,78 +74,258 @@ func TestTemporaryServiceLifecycleAndPortInjection(t *testing.T) {
 	}
 }
 
-func TestSharedServiceAndDuplicateDirectInvocation(t *testing.T) {
+func TestDaemonSerializesConcurrentServiceStartup(t *testing.T) {
 	root := t.TempDir()
-	ready := filepath.Join(root, "ready")
-	servicePort := filepath.Join(root, "service-port")
-	taskPort := filepath.Join(root, "task-port")
-	cfg := testConfig(root, ready, servicePort, taskPort)
-
-	directContext, cancelDirect := context.WithCancel(context.Background())
-	defer cancelDirect()
-	var directOutput safeBuffer
-	direct, err := newRunner(cfg, &directOutput, &directOutput)
-	if err != nil {
-		t.Fatal(err)
+	useIsolatedRuntime(t)
+	ready := root + "/ready"
+	starts := root + "/starts"
+	gate := root + "/gate"
+	cfg := &projectConfig{
+		Root: root,
+		Tasks: map[string]*entry{
+			"db": {
+				Lifecycle: "service",
+				Command: fmt.Sprintf(
+					"trap 'rm -f %s; exit 0' TERM INT; echo start >> %s; touch %s; while :; do sleep 1; done",
+					shellQuote(ready), shellQuote(starts), shellQuote(ready),
+				),
+				Healthcheck: "test -f " + shellQuote(ready),
+			},
+			"one": {
+				Command:   "while [ ! -f " + shellQuote(gate) + " ]; do sleep 0.05; done",
+				DependsOn: []string{"db"},
+			},
+			"two": {
+				Command:   "while [ ! -f " + shellQuote(gate) + " ]; do sleep 0.05; done",
+				DependsOn: []string{"db"},
+			},
+		},
 	}
-	directDone := make(chan error, 1)
-	go func() { directDone <- direct.Run(directContext, "db") }()
-	waitFor(t, 3*time.Second, func() bool {
-		_, err := os.Stat(ready)
-		return err == nil
+	t.Cleanup(func() { stopTestDaemon(cfg.Root) })
+
+	var firstOutput, secondOutput safeBuffer
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() {
+		firstDone <- runDaemonClient(context.Background(), cfg, "one", strings.NewReader(""), &firstOutput, &firstOutput)
+	}()
+	go func() {
+		secondDone <- runDaemonClient(context.Background(), cfg, "two", strings.NewReader(""), &secondOutput, &secondOutput)
+	}()
+
+	waitFor(t, 5*time.Second, func() bool {
+		return pathExists(ready) &&
+			strings.Contains(firstOutput.String(), "Running one...") &&
+			strings.Contains(secondOutput.String(), "Running two...")
 	})
+	writeTestFile(t, gate, "go")
+	if err := waitResult(t, firstDone); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if err := waitResult(t, secondDone); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
 
-	var duplicateOutput safeBuffer
-	duplicate, err := newRunner(cfg, &duplicateOutput, &duplicateOutput)
+	lines := strings.Fields(readTestFile(t, starts))
+	if len(lines) != 1 {
+		t.Fatalf("service was started %d times, want exactly once", len(lines))
+	}
+	combined := firstOutput.String() + secondOutput.String()
+	if !strings.Contains(combined, "Using existing db service.") {
+		t.Fatalf("concurrent request did not reuse daemon-locked service:\n%s", combined)
+	}
+}
+
+func TestServiceNameRemainsLockedWhileStopping(t *testing.T) {
+	root := t.TempDir()
+	useIsolatedRuntime(t)
+	ready := root + "/ready"
+	active := root + "/active"
+	overlap := root + "/overlap"
+	cfg := &projectConfig{
+		Root: root,
+		Tasks: map[string]*entry{
+			"db": {
+				Lifecycle: "service",
+				Command: fmt.Sprintf(
+					"if [ -f %s ]; then touch %s; fi; touch %s %s; trap 'sleep 0.5; rm -f %s %s; exit 0' TERM INT; while :; do sleep 1; done",
+					shellQuote(active), shellQuote(overlap), shellQuote(active), shellQuote(ready),
+					shellQuote(active), shellQuote(ready),
+				),
+				Healthcheck: "test -f " + shellQuote(ready),
+			},
+			"use": {Command: "true", DependsOn: []string{"db"}},
+		},
+	}
+	t.Cleanup(func() { stopTestDaemon(cfg.Root) })
+
+	var firstOutput, secondOutput safeBuffer
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() {
+		firstDone <- runDaemonClient(context.Background(), cfg, "use", strings.NewReader(""), &firstOutput, &firstOutput)
+	}()
+	waitFor(t, 5*time.Second, func() bool {
+		return strings.Contains(firstOutput.String(), "Stopping db because it is no longer required.")
+	})
+	go func() {
+		secondDone <- runDaemonClient(context.Background(), cfg, "use", strings.NewReader(""), &secondOutput, &secondOutput)
+	}()
+
+	if err := waitResult(t, firstDone); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if err := waitResult(t, secondDone); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if pathExists(overlap) {
+		t.Fatal("a replacement service started before the stopping service released its daemon lock")
+	}
+}
+
+func TestClientDisconnectImmediatelyReleasesAndStopsService(t *testing.T) {
+	root := t.TempDir()
+	useIsolatedRuntime(t)
+	ready := root + "/ready"
+	pidFile := root + "/service.pid"
+	cfg := directServiceConfig(root, "db", ready, pidFile, nil)
+	t.Cleanup(func() { stopTestDaemon(cfg.Root) })
+
+	conn, err := connectDaemon(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = duplicate.Run(context.Background(), "db")
-	if err == nil || !strings.Contains(err.Error(), "already running in this worktree") {
-		t.Fatalf("duplicate Run() error = %v", err)
+	sender := &clientSender{encoder: json.NewEncoder(conn)}
+	if err := sender.send(clientMessage{
+		Version: protocolVersion,
+		Type:    "run",
+		Name:    "db",
+		Digest:  configDigest(cfg),
+		Config:  cfg,
+	}); err != nil {
+		t.Fatal(err)
 	}
+	waitFor(t, 5*time.Second, func() bool { return pathExists(ready) })
+	servicePID := readPID(t, pidFile)
 
-	var taskOutput safeBuffer
-	task, err := newRunner(cfg, &taskOutput, &taskOutput)
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return !pathExists(ready) && !testProcessAlive(servicePID)
+	})
+}
+
+func TestDependencyExitStopsDependentServiceAndClient(t *testing.T) {
+	root := t.TempDir()
+	useIsolatedRuntime(t)
+	dbReady := root + "/db.ready"
+	dbPIDFile := root + "/db.pid"
+	devReady := root + "/dev.ready"
+	devPIDFile := root + "/dev.pid"
+	cfg := directServiceConfig(root, "db", dbReady, dbPIDFile, nil)
+	cfg.Tasks["dev"] = serviceEntry(devReady, devPIDFile, []string{"db"})
+	t.Cleanup(func() { stopTestDaemon(cfg.Root) })
+
+	var output safeBuffer
+	done := make(chan error, 1)
+	go func() {
+		done <- runDaemonClient(
+			context.Background(),
+			cfg,
+			"dev",
+			strings.NewReader(""),
+			&output,
+			&output,
+		)
+	}()
+	waitFor(t, 5*time.Second, func() bool { return pathExists(dbReady) && pathExists(devReady) })
+	dbPID := readPID(t, dbPIDFile)
+	devPID := readPID(t, devPIDFile)
+
+	if err := syscall.Kill(dbPID, syscall.SIGKILL); err != nil {
+		t.Fatalf("kill dependency: %v", err)
+	}
+	err := waitResult(t, done)
+	if err == nil || !strings.Contains(err.Error(), `service "db" exited unexpectedly`) {
+		t.Fatalf("client error = %v\noutput:\n%s", err, output.String())
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return !testProcessAlive(devPID) && !pathExists(devReady)
+	})
+}
+
+func TestDaemonDeathKillsManagedServiceAndDisconnectsClient(t *testing.T) {
+	root := t.TempDir()
+	useIsolatedRuntime(t)
+	ready := root + "/ready"
+	pidFile := root + "/service.pid"
+	cfg := directServiceConfig(root, "db", ready, pidFile, nil)
+
+	var output safeBuffer
+	done := make(chan error, 1)
+	go func() {
+		done <- runDaemonClient(
+			context.Background(),
+			cfg,
+			"db",
+			strings.NewReader(""),
+			&output,
+			&output,
+		)
+	}()
+	waitFor(t, 5*time.Second, func() bool { return pathExists(ready) })
+	servicePID := readPID(t, pidFile)
+	paths, err := newRuntimePaths(cfg.Root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := task.Run(context.Background(), "migrate"); err != nil {
-		t.Fatalf("dependent Run() error = %v\noutput:\n%s", err, taskOutput.String())
-	}
-	if _, err := os.Stat(ready); err != nil {
-		t.Fatalf("shared service stopped while direct invocation still needed it: %v", err)
-	}
-	if !strings.Contains(taskOutput.String(), "Using existing db service.") {
-		t.Fatalf("dependent output did not report reuse:\n%s", taskOutput.String())
-	}
-	if !strings.Contains(taskOutput.String(), "db remains active because it is still required by db.") {
-		t.Fatalf("dependent output did not report active owner:\n%s", taskOutput.String())
-	}
+	daemonPID := readPID(t, paths.pid)
 
-	cancelDirect()
-	select {
-	case err := <-directDone:
-		if err == nil || !strings.Contains(err.Error(), "context canceled") {
-			t.Fatalf("direct Run() error = %v, want context cancellation", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("direct service did not stop after cancellation")
+	if err := syscall.Kill(daemonPID, syscall.SIGKILL); err != nil {
+		t.Fatalf("kill daemon: %v", err)
 	}
-	waitFor(t, 2*time.Second, func() bool {
-		_, err := os.Stat(ready)
-		return os.IsNotExist(err)
+	err = waitResult(t, done)
+	if err == nil || !strings.Contains(err.Error(), "daemon stopped unexpectedly") {
+		t.Fatalf("client error = %v", err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		return !testProcessAlive(servicePID)
 	})
 }
 
 func TestServicesStopInDependentOrder(t *testing.T) {
-	runner := &runner{cfg: &projectConfig{Tasks: map[string]*entry{
+	manager := &serviceManager{cfg: &projectConfig{Tasks: map[string]*entry{
 		"db":  {Lifecycle: "service", Command: "db", Healthcheck: "true"},
 		"dev": {Lifecycle: "service", Command: "dev", Healthcheck: "true", DependsOn: []string{"db"}},
 	}}}
-	order := strings.Join(runner.serviceStopOrder(), ",")
+	order := strings.Join(manager.serviceStopOrder(), ",")
 	if order != "dev,db" {
 		t.Fatalf("serviceStopOrder() = %q, want %q", order, "dev,db")
+	}
+}
+
+func directServiceConfig(
+	root, name, ready, pidFile string,
+	dependencies []string,
+) *projectConfig {
+	return &projectConfig{
+		Root: root,
+		Tasks: map[string]*entry{
+			name: serviceEntry(ready, pidFile, dependencies),
+		},
+	}
+}
+
+func serviceEntry(ready, pidFile string, dependencies []string) *entry {
+	return &entry{
+		Lifecycle: "service",
+		Command: fmt.Sprintf(
+			"trap 'rm -f %s; exit 0' TERM INT; echo $$ > %s; touch %s; while :; do sleep 1; done",
+			shellQuote(ready), shellQuote(pidFile), shellQuote(ready),
+		),
+		Healthcheck: "test -f " + shellQuote(ready),
+		DependsOn:   dependencies,
 	}
 }
 
@@ -152,6 +348,61 @@ func testConfig(root, ready, servicePort, taskPort string) *projectConfig {
 				DependsOn: []string{"db"},
 			},
 		},
+	}
+}
+
+func useIsolatedRuntime(t *testing.T) {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "pumice-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+}
+
+func stopTestDaemon(root string) {
+	paths, err := newRuntimePaths(root)
+	if err != nil {
+		return
+	}
+	data, err := os.ReadFile(paths.pid)
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err == nil && pid > 0 {
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+	}
+}
+
+func readPID(t *testing.T, filename string) int {
+	t.Helper()
+	pid, err := strconv.Atoi(strings.TrimSpace(readTestFile(t, filename)))
+	if err != nil {
+		t.Fatalf("parse pid in %s: %v", filename, err)
+	}
+	return pid
+}
+
+func testProcessAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
+}
+
+func pathExists(filename string) bool {
+	_, err := os.Stat(filename)
+	return err == nil
+}
+
+func waitResult(t *testing.T, result <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(8 * time.Second):
+		t.Fatal("operation did not finish before timeout")
+		return nil
 	}
 }
 

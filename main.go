@@ -13,6 +13,14 @@ import (
 var version = "0.0.1-alpha"
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "_daemon":
+			os.Exit(runDaemon(os.Args[2:]))
+		case "_exec":
+			os.Exit(runExecSupervisor(os.Args[2:]))
+		}
+	}
 	os.Exit(runCLI(os.Args[1:], os.Stdout, os.Stderr))
 }
 
@@ -35,12 +43,7 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	runner, err := newRunner(cfg, stdout, stderr)
-	if err != nil {
-		fmt.Fprintf(stderr, "pum: %v\n", err)
-		return 1
-	}
-	if err := runner.Run(ctx, args[1]); err != nil {
+	if err := runDaemonClient(ctx, cfg, args[1], os.Stdin, stdout, stderr); err != nil {
 		if errors.Is(err, context.Canceled) {
 			return 130
 		}

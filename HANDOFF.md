@@ -1,115 +1,78 @@
-# Pumice Go Implementation Handoff
+# Pumice Daemon Architecture Handoff
 
-## Objective
+## Runtime model
 
-The user asked to implement the service described in `DESIGN.md` in Go. The
-repository initially contained only `README.md`, `DESIGN.md`, `LICENSE`, and
-`.gitignore`.
+Pumice now uses a worktree-scoped daemon instead of coordinating independent
+CLI process owners through a JSON registry.
 
-The implementation is complete.
+The CLI loads and validates `pumice.yaml`, connects to the daemon over a
+permission-restricted Unix socket, and proxies stdin/stdout/stderr. The daemon
+is the sole owner of:
 
-## What Was Implemented
+- service locks, including the `starting` state;
+- active invocation references;
+- service dependency state;
+- managed ports; and
+- every task, service, and health-check process.
 
-Pumice now provides a `pum run <task>` CLI with the V1 behavior described in
-`DESIGN.md`:
+The daemon exits after ten idle seconds. A startup flock and a lifetime flock
+prevent daemon startup races.
 
-- Loads `pumice.yaml` or `pumice.yml`, searching from the current directory
-  upward.
-- Validates commands, service health checks, dependencies, lifecycle values,
-  environment-variable-style port names, and dependency cycles.
-- Treats regular entries as finite tasks and `lifecycle: service` entries as
-  long-running services.
-- Executes dependencies in order and runs each dependency once per invocation.
-- Waits for service health checks before starting dependents.
-- Allocates worktree-scoped ports and injects them into commands and health
-  checks as environment variables.
-- Coordinates concurrent CLI processes through a locked JSON state file in
-  the user runtime directory, with a `/tmp` fallback.
-- Reuses services across terminals in the same canonical Git worktree.
-- Tracks service users by invocation and stops a service after its last user
-  exits.
-- Stops dependent services before their service dependencies.
-- Detects stale CLI/service processes during later registry access.
-- Rejects a direct invocation when that service is already running, because
-  V1 does not support attaching to existing logs.
-- Runs services in separate process groups and terminates their descendants on
-  shutdown.
-- Shows direct-service output in the invoking terminal. Output from services
-  started only as dependencies is discarded so those services can safely
-  outlive the launching process without holding its output pipe open.
-- Handles `SIGINT` and `SIGTERM`.
+## Failure guarantees
 
-## Main Files
+Every project command runs behind the internal `_exec` supervisor. The daemon
+holds the write side of a private lease pipe and the supervisor holds the read
+side. An unexpected daemon exit closes the lease in the kernel, causing the
+supervisor to kill the command's process group. This mechanism is portable
+across the supported Unix platforms and does not rely solely on Linux parent
+death signals.
 
-- `main.go`: CLI parsing, signal context, error reporting, and exit codes.
-- `config.go`: YAML discovery, parsing, Git worktree canonicalization, and
-  validation.
-- `registry.go`: locked runtime state, port allocation, stale-state cleanup,
-  atomic state writes, process checks, and process-group termination.
-- `runner.go`: dependency execution, service startup/reuse, health checks,
-  lifecycle messages, reference release, and shutdown ordering.
-- `config_test.go`: configuration and YAML validation tests.
-- `runner_test.go`: temporary-service, shared-service, duplicate-invocation,
-  managed-port, lifecycle-output, and shutdown-order tests.
-- `go.mod`: module `github.com/coral-535/pumice`, requiring Go 1.26.5.
-- `go.sum`: checksums for `gopkg.in/yaml.v3` and its transitive module
-  metadata.
-- `README.md`: expanded build, configuration, and usage documentation.
+The client connection is also a lease. EOF immediately cancels its invocation
+and releases all service references. An unexpected service exit is observed
+through `Wait`, not a health check; the daemon stops transitive dependent
+services and cancels every affected invocation.
 
-## Verification Performed
+## Locking
 
-The workspace uses the installed Go 1.26.5 toolchain.
+The daemon inserts a service record while holding its manager mutex before
+launching the process. That record is the service-name lock for startup,
+running, and shutdown; it is removed only after process-group termination
+completes. Concurrent dependency requests wait on the same readiness channel.
+A direct duplicate request fails clearly.
 
-The following completed successfully:
+Ports are values managed by the daemon, not locks.
+
+## Main files
+
+- `main.go`: public CLI and dispatch for internal daemon/supervisor modes.
+- `client.go`: daemon startup serialization, IPC client, and stdio proxying.
+- `daemon.go`: Unix socket server, configuration epochs, connection leases,
+  and bounded asynchronous stdin relay.
+- `runner.go`: daemon-owned service manager, atomic service locking,
+  references, health readiness, exit propagation, and shutdown ordering.
+- `managed_process.go`: process lease supervisor and process-group shutdown.
+- `registry.go`: secure worktree runtime-path derivation.
+- `protocol.go`: versioned client/daemon wire messages.
+- `runner_test.go`: black-box concurrency and crash regression tests.
+
+## Verification
+
+The integration suite covers:
+
+- temporary dependency lifecycle and port injection;
+- simultaneous cold-start locking;
+- abrupt client disconnect;
+- dependency-process death;
+- daemon `SIGKILL`; and
+- dependent-before-dependency shutdown order.
+
+Run:
 
 ```sh
 go test -race ./...
 go vet ./...
-go build -o /tmp/pum ./
-git diff --check
-/tmp/pum --version
+go build ./...
 ```
 
-The race-enabled test result was:
-
-```text
-ok github.com/coral-535/pumice
-```
-
-The lifecycle tests require permission to bind an ephemeral localhost socket
-because managed ports are allocated with `127.0.0.1:0`. In this particular
-sandbox, `go test` therefore had to run with elevated sandbox permission.
-
-## Design Decisions and Caveats
-
-- Runtime identity is a SHA-256-derived key of the canonical worktree path.
-  Moving or copying a worktree therefore yields a different runtime identity.
-- State is written beneath `$XDG_RUNTIME_DIR/pumice` when writable, otherwise
-  beneath `/tmp/pumice-<uid>`.
-- Health-check timeout is currently fixed at 30 seconds with a 200 ms retry
-  interval.
-- Managed ports are selected by briefly binding an ephemeral localhost port
-  and then releasing it. This follows the V1 requirement but retains the usual
-  small bind race before the application claims the port.
-- If a CLI process is killed with an uncatchable signal, its services are
-  cleaned up lazily the next time another Pumice invocation accesses that
-  worktree's registry.
-- The implementation is Unix-oriented: it uses `sh`, `syscall.Flock`, Unix
-  signals, and process groups.
-- Directly running any already-active service fails, even if the existing
-  instance was originally started as a dependency. This is consistent with
-  the V1 inability to attach output to an existing process.
-- Dependency-service output is discarded. If persistent dependency logs are
-  desired, add per-service log files and expose their paths without reattaching
-  the original invocation's pipes.
-
-## Suggested Next Steps
-
-1. Review the implementation and decide whether dependency-service logs should
-   be persisted.
-2. Add a true multi-process CLI acceptance test if stronger coverage of
-   cross-terminal locking is desired; current integration tests exercise the
-   shared registry and concurrent runners within one test process.
-3. Consider configurable health-check timeout/interval only if the V1 schema
-   should expand beyond `DESIGN.md`.
-4. Run the tests on a normal developer machine with Go 1.26.5.
+The tests create Unix sockets and ephemeral localhost listeners, which can
+require extra permission in a restricted sandbox.
