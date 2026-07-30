@@ -13,6 +13,46 @@ pum run db:migrate
 
 Pumice automatically starts, reuses, and stops any required services.
 
+## Runtime architecture
+
+Each canonical Git worktree has one short-lived Pumice daemon. CLI processes
+connect to that daemon over a user-only Unix socket; they never launch or own
+project commands directly.
+
+The daemon namespace and lifetime lock are scoped by canonical worktree, not by
+npm package version. Different repositories therefore cannot collide. Within
+one worktree, all compatible clients use the same daemon; compatibility is
+defined by the IPC protocol version. A breaking daemon/protocol change must
+bump that version. Running parallel daemons for different package versions in
+one worktree is forbidden because it would create two service-lock authorities.
+
+After the last connection and managed service disappear, the daemon exits
+following a 250 ms grace period. Consequently, after an npm package upgrade,
+the next invocation starts the new binary as soon as the previous worktree is
+idle.
+
+The daemon is the single authority for:
+
+* service-name locks and startup state;
+* invocation references and dependency relationships;
+* managed port values;
+* command, service, and health-check processes; and
+* propagation of service exits to dependents.
+
+A service lock covers `starting`, `healthy`, and `stopping` states. The daemon
+reserves the service name atomically before it launches the process and does
+not release it until process-group shutdown completes, so concurrent requests
+cannot overlap service instances even when the service has no port.
+
+Every command is launched through a small process supervisor with a private
+lease pipe held by the daemon. If the daemon exits or is killed, the kernel
+closes every lease and the supervisors kill their complete command process
+groups. Likewise, each CLI connection is an invocation lease: disconnecting a
+CLI immediately releases its service references.
+
+Health checks establish readiness only. They are not used for ownership,
+locking, or detecting whether a known process exited.
+
 ## Core concepts
 
 Pumice has two kinds of runnable entries:
@@ -56,6 +96,10 @@ The meaning of `depends_on` depends on the referenced entry:
 * When depending on a service, start or reuse it and wait for its health check to succeed.
 
 A service remains running while at least one active command requires it.
+
+If a service process exits, the daemon immediately stops every running service
+that transitively depends on it and fails their active invocations. This is
+driven by process-exit events rather than health checks.
 
 ## Direct service execution
 
@@ -214,3 +258,23 @@ Running `pum run dev` in two different worktrees creates independent `dev` and `
 ### Duplicate service invocation
 
 Running `pum run dev` twice in the same worktree causes the second direct invocation to fail without affecting the first.
+
+### Concurrent cold start
+
+Running two tasks that both require a stopped service starts exactly one
+instance. Both requests wait on the same daemon-owned startup record.
+
+### Client crash
+
+Killing a CLI process closes its daemon connection. Its references are released
+immediately, and any service with no remaining users is stopped.
+
+### Dependency crash
+
+If a service exits unexpectedly, all transitive dependent services are stopped
+and their CLI invocations fail, independently of configured health checks.
+
+### Daemon crash
+
+Killing the worktree daemon closes all process leases and client connections.
+Every managed process group and every listening CLI terminates immediately.

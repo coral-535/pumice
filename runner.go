@@ -5,335 +5,568 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
-	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
+
+// runner preserves the package-level execution API while routing all work
+// through the daemon. Keeping this small adapter also makes embedders and older
+// package tests receive the same ownership guarantees as the CLI.
+type runner struct {
+	cfg    *projectConfig
+	stdout io.Writer
+	stderr io.Writer
+}
+
+func newRunner(cfg *projectConfig, stdout, stderr io.Writer) (*runner, error) {
+	if _, err := newRuntimePaths(cfg.Root); err != nil {
+		return nil, err
+	}
+	return &runner{cfg: cfg, stdout: stdout, stderr: stderr}, nil
+}
+
+func (r *runner) Run(ctx context.Context, name string) error {
+	return runDaemonClient(ctx, r.cfg, name, os.Stdin, r.stdout, r.stderr)
+}
+
+func (r *runner) serviceStopOrder() []string {
+	manager := &serviceManager{cfg: r.cfg}
+	return manager.serviceStopOrder()
+}
 
 const (
 	healthTimeout  = 30 * time.Second
 	healthInterval = 200 * time.Millisecond
 )
 
-type runner struct {
+type serviceManager struct {
+	ctx         context.Context
+	cancel      context.CancelFunc
+	mu          sync.Mutex
 	cfg         *projectConfig
-	registry    *registry
-	stdout      io.Writer
-	stderr      io.Writer
-	id          string
-	label       string
 	ports       map[string]string
-	completed   map[string]bool
-	releaseOnce sync.Once
+	services    map[string]*daemonService
+	invocations map[string]*daemonInvocation
+	nextID      uint64
 }
 
-type managedProcess struct {
-	pid  int
-	done chan error
+type daemonService struct {
+	name      string
+	process   *managedCommand
+	refs      map[string]string
+	ready     chan struct{}
+	readyOnce sync.Once
+	stopped   chan struct{}
+	cleanup   sync.Once
+	healthy   bool
+	startErr  error
+	stopping  bool
 }
 
-func newRunner(cfg *projectConfig, stdout, stderr io.Writer) (*runner, error) {
-	reg, err := newRegistry(cfg.Root, cfg.Ports)
+type daemonInvocation struct {
+	id       string
+	label    string
+	ctx      context.Context
+	cancel   context.CancelFunc
+	stderr   io.Writer
+	acquired map[string]bool
+	failure  error
+}
+
+func newServiceManager(cfg *projectConfig) (*serviceManager, error) {
+	ports, err := allocatePorts(cfg.Ports)
 	if err != nil {
 		return nil, err
 	}
-	return &runner{
-		cfg:       cfg,
-		registry:  reg,
-		stdout:    stdout,
-		stderr:    stderr,
-		id:        fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()),
-		completed: make(map[string]bool),
+	ctx, cancel := context.WithCancel(context.Background())
+	return &serviceManager{
+		ctx:         ctx,
+		cancel:      cancel,
+		cfg:         cfg,
+		ports:       ports,
+		services:    make(map[string]*daemonService),
+		invocations: make(map[string]*daemonInvocation),
 	}, nil
 }
 
-func (r *runner) Run(ctx context.Context, name string) (runErr error) {
-	target, ok := r.cfg.Tasks[name]
+func allocatePorts(names []string) (map[string]string, error) {
+	ports := make(map[string]string, len(names))
+	for _, name := range names {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, fmt.Errorf("allocate port for %s: %w", name, err)
+		}
+		ports[name] = strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+		if err := listener.Close(); err != nil {
+			return nil, fmt.Errorf("release allocated port for %s: %w", name, err)
+		}
+	}
+	return ports, nil
+}
+
+func (m *serviceManager) idle() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.invocations) == 0 && len(m.services) == 0
+}
+
+func (m *serviceManager) run(
+	parent context.Context,
+	name string,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+) (runErr error) {
+	target, ok := m.cfg.Tasks[name]
 	if !ok {
 		return fmt.Errorf("unknown task %q", name)
 	}
-	r.label = name
-	if err := r.begin(); err != nil {
-		return err
-	}
+
+	inv := m.beginInvocation(parent, name, stderr)
 	defer func() {
-		if err := r.release(); runErr == nil && err != nil {
-			runErr = err
+		m.releaseInvocation(inv)
+		if failure := m.invocationFailure(inv); failure != nil {
+			runErr = failure
 		}
 	}()
 
+	completed := make(map[string]bool)
 	if target.isService() {
 		for _, dependency := range target.DependsOn {
-			if err := r.execute(ctx, dependency); err != nil {
+			if err := m.execute(inv, dependency, stdin, stdout, stderr, completed); err != nil {
 				return err
 			}
 		}
-		process, err := r.ensureService(ctx, name, true)
-		if err != nil {
+		if _, err := m.ensureService(inv, name, true, stdout, stderr); err != nil {
 			return err
 		}
-		if process == nil {
-			return fmt.Errorf("direct service %q has no local process", name)
+		<-inv.ctx.Done()
+		if failure := m.invocationFailure(inv); failure != nil {
+			return failure
 		}
-		select {
-		case err := <-process.done:
-			if err != nil && ctx.Err() == nil {
-				return fmt.Errorf("service %q exited: %w", name, err)
-			}
-			return ctx.Err()
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		return inv.ctx.Err()
 	}
-	return r.execute(ctx, name)
+	return m.execute(inv, name, stdin, stdout, stderr, completed)
 }
 
-func (r *runner) begin() error {
-	return r.registry.withLock(func(state *runtimeState) error {
-		if err := r.registry.ensurePorts(state); err != nil {
-			return err
-		}
-		state.Invocations[r.id] = &invocation{
-			PID:       os.Getpid(),
-			Label:     r.label,
-			StartedAt: time.Now().UTC().Format(time.RFC3339Nano),
-		}
-		r.ports = cloneMap(state.Ports)
-		return nil
-	})
+func (m *serviceManager) beginInvocation(
+	parent context.Context,
+	label string,
+	stderr io.Writer,
+) *daemonInvocation {
+	ctx, cancel := context.WithCancel(parent)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextID++
+	inv := &daemonInvocation{
+		id:       fmt.Sprintf("%d", m.nextID),
+		label:    label,
+		ctx:      ctx,
+		cancel:   cancel,
+		stderr:   stderr,
+		acquired: make(map[string]bool),
+	}
+	m.invocations[inv.id] = inv
+	return inv
 }
 
-func (r *runner) execute(ctx context.Context, name string) error {
-	if r.completed[name] {
+func (m *serviceManager) execute(
+	inv *daemonInvocation,
+	name string,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+	completed map[string]bool,
+) error {
+	if completed[name] {
 		return nil
 	}
-	task := r.cfg.Tasks[name]
+	task := m.cfg.Tasks[name]
 	for _, dependency := range task.DependsOn {
-		if err := r.execute(ctx, dependency); err != nil {
+		if err := m.execute(inv, dependency, stdin, stdout, stderr, completed); err != nil {
 			return err
 		}
 	}
 	if task.isService() {
-		if _, err := r.ensureService(ctx, name, false); err != nil {
+		if _, err := m.ensureService(inv, name, false, stdout, stderr); err != nil {
 			return err
 		}
-		r.completed[name] = true
+		completed[name] = true
 		return nil
 	}
 
-	fmt.Fprintf(r.stderr, "Running %s...\n", name)
-	cmd := r.shellCommand(ctx, task.Command)
-	cmd.Stdout = r.stdout
-	cmd.Stderr = r.stderr
-	cmd.Stdin = os.Stdin
-	if err := cmd.Run(); err != nil {
+	fmt.Fprintf(stderr, "Running %s...\n", name)
+	err := m.runCommand(inv.ctx, task.Command, stdin, stdout, stderr)
+	if err != nil {
+		if failure := m.invocationFailure(inv); failure != nil {
+			return failure
+		}
 		return fmt.Errorf("%s failed: %w", name, err)
 	}
-	fmt.Fprintf(r.stderr, "%s completed.\n", name)
-	r.completed[name] = true
+	fmt.Fprintf(stderr, "%s completed.\n", name)
+	completed[name] = true
 	return nil
 }
 
-func (r *runner) ensureService(ctx context.Context, name string, direct bool) (*managedProcess, error) {
-	task := r.cfg.Tasks[name]
-	var process *managedProcess
-	var existing, healthy bool
-
-	err := r.registry.withLock(func(state *runtimeState) error {
-		svc, ok := state.Services[name]
-		if ok {
-			if direct {
-				return fmt.Errorf(
-					"Service %q is already running in this worktree.\nAttaching to an existing service is not supported.",
-					name,
-				)
+func (m *serviceManager) ensureService(
+	inv *daemonInvocation,
+	name string,
+	direct bool,
+	stdout, stderr io.Writer,
+) (*daemonService, error) {
+	m.mu.Lock()
+	if inv.acquired[name] {
+		svc := m.services[name]
+		m.mu.Unlock()
+		if svc == nil {
+			return nil, fmt.Errorf("service %q is no longer running", name)
+		}
+		return svc, m.awaitService(inv, svc)
+	}
+	if existing := m.services[name]; existing != nil {
+		if existing.stopping {
+			stopped := existing.stopped
+			m.mu.Unlock()
+			select {
+			case <-stopped:
+				return m.ensureService(inv, name, direct, stdout, stderr)
+			case <-inv.ctx.Done():
+				if failure := m.invocationFailure(inv); failure != nil {
+					return nil, failure
+				}
+				return nil, inv.ctx.Err()
 			}
-			svc.Refs[r.id] = r.label
-			existing = true
-			healthy = svc.Healthy
-			return nil
 		}
-
-		fmt.Fprintf(r.stderr, "Starting %s...\n", name)
-		cmd := r.shellCommand(context.Background(), task.Command)
 		if direct {
-			cmd.Stdout = r.stdout
-			cmd.Stderr = r.stderr
-			cmd.Stdin = os.Stdin
-		} else {
-			// Dependency services can outlive the invocation that launched them.
-			// Do not leave that invocation's output pipe or terminal descriptors
-			// attached indefinitely.
-			cmd.Stdout = io.Discard
-			cmd.Stderr = io.Discard
+			m.mu.Unlock()
+			return nil, fmt.Errorf(
+				"Service %q is already running in this worktree.\nAttaching to an existing service is not supported.",
+				name,
+			)
 		}
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		if err := cmd.Start(); err != nil {
-			return fmt.Errorf("start service %q: %w", name, err)
-		}
-		process = &managedProcess{pid: cmd.Process.Pid, done: make(chan error, 1)}
-		state.Services[name] = &service{
-			PID:       process.pid,
-			Command:   task.Command,
-			StartedAt: time.Now().UTC().Format(time.RFC3339Nano),
-			Refs:      map[string]string{r.id: r.label},
-		}
-		go func() {
-			err := cmd.Wait()
-			process.done <- err
-			close(process.done)
-			r.markExited(name, process.pid)
-		}()
-		return nil
-	})
-	if err != nil {
-		if process != nil {
-			stopProcess(process.pid)
-		}
-		return nil, err
-	}
-	if existing {
-		fmt.Fprintf(r.stderr, "Using existing %s service.\n", name)
+		existing.refs[inv.id] = inv.label
+		inv.acquired[name] = true
+		healthy := existing.healthy
+		m.mu.Unlock()
+		fmt.Fprintf(stderr, "Using existing %s service.\n", name)
 		if healthy {
-			return nil, nil
+			return existing, nil
 		}
-	} else if direct {
-		// A direct service is always newly started, so its process can be waited on.
-	} else if process == nil {
-		return nil, fmt.Errorf("service %q has no managed process", name)
+		return existing, m.awaitService(inv, existing)
 	}
 
-	if !healthy {
-		fmt.Fprintf(r.stderr, "Waiting for %s to become healthy...\n", name)
-		if err := r.waitHealthy(ctx, name, task.Healthcheck); err != nil {
-			return nil, err
-		}
-		fmt.Fprintf(r.stderr, "%s is healthy.\n", name)
+	svc := &daemonService{
+		name:    name,
+		refs:    map[string]string{inv.id: inv.label},
+		ready:   make(chan struct{}),
+		stopped: make(chan struct{}),
 	}
-	if process == nil {
-		return nil, nil
+	m.services[name] = svc
+	inv.acquired[name] = true
+	m.mu.Unlock()
+
+	fmt.Fprintf(stderr, "Starting %s...\n", name)
+	serviceStdout, serviceStderr := io.Discard, io.Discard
+	if direct {
+		serviceStdout, serviceStderr = stdout, stderr
 	}
-	return process, nil
+	go m.initializeService(svc, m.cfg.Tasks[name], serviceStdout, serviceStderr, stderr)
+	return svc, m.awaitService(inv, svc)
 }
 
-func (r *runner) waitHealthy(ctx context.Context, name, healthcheck string) error {
-	ctx, cancel := context.WithTimeout(ctx, healthTimeout)
+func (m *serviceManager) initializeService(
+	svc *daemonService,
+	task *entry,
+	stdout, stderr, lifecycle io.Writer,
+) {
+	process, err := startManagedCommand(m.cfg.Root, task.Command, m.commandEnv(), nil, stdout, stderr)
+	if err != nil {
+		m.failServiceStart(svc, fmt.Errorf("start service %q: %w", svc.name, err))
+		return
+	}
+
+	m.mu.Lock()
+	if svc.stopping || m.services[svc.name] != svc {
+		m.mu.Unlock()
+		m.completeServiceStop(svc, process)
+		return
+	}
+	svc.process = process
+	m.mu.Unlock()
+
+	go func() {
+		err := <-process.done
+		m.serviceExited(svc, err)
+	}()
+
+	fmt.Fprintf(lifecycle, "Waiting for %s to become healthy...\n", svc.name)
+	ctx, cancel := context.WithTimeout(m.ctx, healthTimeout)
 	defer cancel()
 	ticker := time.NewTicker(healthInterval)
 	defer ticker.Stop()
 
 	for {
-		if !r.serviceAlive(name) {
-			return fmt.Errorf("service %q exited before becoming healthy", name)
+		m.mu.Lock()
+		active := m.services[svc.name] == svc && !svc.stopping && svc.startErr == nil
+		m.mu.Unlock()
+		if !active {
+			return
 		}
-		cmd := r.shellCommand(ctx, healthcheck)
-		cmd.Stdout = io.Discard
-		cmd.Stderr = io.Discard
-		if err := cmd.Run(); err == nil {
-			return r.registry.withLock(func(state *runtimeState) error {
-				svc, ok := state.Services[name]
-				if !ok {
-					return fmt.Errorf("service %q exited before becoming healthy", name)
-				}
-				svc.Healthy = true
-				return nil
-			})
+
+		if err := m.runCommand(ctx, task.Healthcheck, nil, io.Discard, io.Discard); err == nil {
+			m.mu.Lock()
+			if m.services[svc.name] == svc && !svc.stopping && svc.startErr == nil {
+				svc.healthy = true
+				svc.readyOnce.Do(func() { close(svc.ready) })
+				m.mu.Unlock()
+				fmt.Fprintf(lifecycle, "%s is healthy.\n", svc.name)
+				return
+			}
+			m.mu.Unlock()
+			return
 		}
+
 		select {
 		case <-ctx.Done():
+			var startErr error
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return fmt.Errorf("service %q did not become healthy within %s", name, healthTimeout)
+				startErr = fmt.Errorf("service %q did not become healthy within %s", svc.name, healthTimeout)
+			} else {
+				startErr = ctx.Err()
 			}
-			return ctx.Err()
+			m.failServiceStart(svc, startErr)
+			return
 		case <-ticker.C:
 		}
 	}
 }
 
-func (r *runner) shellCommand(ctx context.Context, command string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "sh", "-c", command)
-	cmd.Dir = r.cfg.Root
-	cmd.Env = os.Environ()
-	names := make([]string, 0, len(r.ports))
-	for name := range r.ports {
+func (m *serviceManager) awaitService(inv *daemonInvocation, svc *daemonService) error {
+	select {
+	case <-svc.ready:
+		m.mu.Lock()
+		err := svc.startErr
+		healthy := svc.healthy
+		m.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		if !healthy {
+			return fmt.Errorf("service %q exited before becoming healthy", svc.name)
+		}
+		return nil
+	case <-inv.ctx.Done():
+		if failure := m.invocationFailure(inv); failure != nil {
+			return failure
+		}
+		return inv.ctx.Err()
+	}
+}
+
+func (m *serviceManager) failServiceStart(svc *daemonService, err error) {
+	var process *managedCommand
+	var cancels []context.CancelFunc
+	m.mu.Lock()
+	if svc.startErr == nil {
+		svc.startErr = err
+	}
+	svc.readyOnce.Do(func() { close(svc.ready) })
+	svc.stopping = true
+	process = svc.process
+	for id := range svc.refs {
+		if inv := m.invocations[id]; inv != nil {
+			if inv.failure == nil {
+				inv.failure = err
+			}
+			cancels = append(cancels, inv.cancel)
+		}
+	}
+	m.mu.Unlock()
+	m.completeServiceStop(svc, process)
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func (m *serviceManager) serviceExited(svc *daemonService, processErr error) {
+	var stops []*daemonService
+	var cancels []context.CancelFunc
+
+	m.mu.Lock()
+	if svc.stopping {
+		svc.readyOnce.Do(func() { close(svc.ready) })
+		m.mu.Unlock()
+		return
+	}
+	if m.services[svc.name] != svc {
+		m.mu.Unlock()
+		return
+	}
+
+	failure := fmt.Errorf("service %q exited unexpectedly", svc.name)
+	if processErr != nil {
+		failure = fmt.Errorf("service %q exited unexpectedly: %w", svc.name, processErr)
+	}
+	svc.startErr = failure
+	svc.readyOnce.Do(func() { close(svc.ready) })
+
+	affected := map[string]bool{svc.name: true}
+	for changed := true; changed; {
+		changed = false
+		for name := range m.services {
+			if affected[name] {
+				continue
+			}
+			for _, dependency := range m.cfg.Tasks[name].DependsOn {
+				if affected[dependency] {
+					affected[name] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+
+	cancelSet := make(map[string]bool)
+	for name := range affected {
+		candidate := m.services[name]
+		if candidate == nil {
+			continue
+		}
+		candidate.stopping = true
+		if candidate.startErr == nil {
+			candidate.startErr = fmt.Errorf(
+				"service %q stopped because dependency %q exited",
+				name, svc.name,
+			)
+		}
+		candidate.readyOnce.Do(func() { close(candidate.ready) })
+		if candidate != svc && candidate.process != nil {
+			stops = append(stops, candidate)
+		}
+		for id := range candidate.refs {
+			cancelSet[id] = true
+		}
+	}
+	for id := range cancelSet {
+		if inv := m.invocations[id]; inv != nil {
+			if inv.failure == nil {
+				inv.failure = failure
+			}
+			cancels = append(cancels, inv.cancel)
+		}
+	}
+	m.mu.Unlock()
+
+	m.completeServiceStop(svc, nil)
+	for _, candidate := range stops {
+		m.completeServiceStop(candidate, candidate.process)
+	}
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func (m *serviceManager) runCommand(
+	ctx context.Context,
+	command string,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+) error {
+	process, err := startManagedCommand(m.cfg.Root, command, m.commandEnv(), stdin, stdout, stderr)
+	if err != nil {
+		return err
+	}
+	select {
+	case err := <-process.done:
+		return err
+	case <-ctx.Done():
+		process.stop(false)
+		<-process.done
+		return ctx.Err()
+	}
+}
+
+func (m *serviceManager) commandEnv() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	names := make([]string, 0, len(m.ports))
+	for name := range m.ports {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+	env := make([]string, 0, len(names))
 	for _, name := range names {
-		cmd.Env = append(cmd.Env, name+"="+r.ports[name])
+		env = append(env, name+"="+m.ports[name])
 	}
-	return cmd
+	return env
 }
 
-func (r *runner) serviceAlive(name string) bool {
-	alive := false
-	_ = r.registry.withLock(func(state *runtimeState) error {
-		svc, ok := state.Services[name]
-		alive = ok && processAlive(svc.PID)
-		return nil
-	})
-	return alive
+func (m *serviceManager) invocationFailure(inv *daemonInvocation) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return inv.failure
 }
 
-func (r *runner) markExited(name string, pid int) {
-	_ = r.registry.withLock(func(state *runtimeState) error {
-		if svc := state.Services[name]; svc != nil && svc.PID == pid {
-			delete(state.Services, name)
+func (m *serviceManager) releaseInvocation(inv *daemonInvocation) {
+	inv.cancel()
+	var stops []*daemonService
+
+	m.mu.Lock()
+	delete(m.invocations, inv.id)
+	for name := range inv.acquired {
+		if svc := m.services[name]; svc != nil {
+			delete(svc.refs, inv.id)
 		}
-		return nil
+	}
+
+	for _, name := range m.serviceStopOrder() {
+		svc := m.services[name]
+		if svc == nil {
+			continue
+		}
+		if svc.stopping {
+			continue
+		}
+		if len(svc.refs) != 0 {
+			owners := uniqueOwners(svc.refs)
+			fmt.Fprintf(inv.stderr, "%s remains active because it is still required by %s.\n",
+				name, strings.Join(owners, ", "))
+			continue
+		}
+		fmt.Fprintf(inv.stderr, "Stopping %s because it is no longer required.\n", name)
+		svc.stopping = true
+		svc.readyOnce.Do(func() { close(svc.ready) })
+		stops = append(stops, svc)
+	}
+	m.mu.Unlock()
+
+	for _, svc := range stops {
+		if svc.process != nil {
+			m.completeServiceStop(svc, svc.process)
+		}
+	}
+}
+
+func (m *serviceManager) completeServiceStop(svc *daemonService, process *managedCommand) {
+	svc.cleanup.Do(func() {
+		if process != nil {
+			process.stop(false)
+			<-process.done
+		}
+		m.mu.Lock()
+		if m.services[svc.name] == svc {
+			delete(m.services, svc.name)
+		}
+		close(svc.stopped)
+		m.mu.Unlock()
 	})
 }
 
-func (r *runner) release() error {
-	var releaseErr error
-	r.releaseOnce.Do(func() {
-		releaseErr = r.registry.withLock(func(state *runtimeState) error {
-			delete(state.Invocations, r.id)
-			for _, svc := range state.Services {
-				delete(svc.Refs, r.id)
-			}
-			order := r.serviceStopOrder()
-			inOrder := make(map[string]bool, len(order))
-			for _, name := range order {
-				inOrder[name] = true
-			}
-			var unknown []string
-			for name := range state.Services {
-				if !inOrder[name] {
-					unknown = append(unknown, name)
-				}
-			}
-			sort.Strings(unknown)
-			order = append(order, unknown...)
-			for _, name := range order {
-				svc := state.Services[name]
-				if svc == nil {
-					continue
-				}
-				if len(svc.Refs) != 0 {
-					owners := uniqueOwners(svc.Refs)
-					fmt.Fprintf(r.stderr, "%s remains active because it is still required by %s.\n",
-						name, strings.Join(owners, ", "))
-					continue
-				}
-				fmt.Fprintf(r.stderr, "Stopping %s because it is no longer required.\n", name)
-				stopProcess(svc.PID)
-				delete(state.Services, name)
-			}
-			if len(state.Services) == 0 && len(state.Invocations) == 0 {
-				state.Ports = make(map[string]string)
-			}
-			return nil
-		})
-	})
-	return releaseErr
-}
-
-func (r *runner) serviceStopOrder() []string {
+func (m *serviceManager) serviceStopOrder() []string {
 	seen := make(map[string]bool)
 	var order []string
 	var visit func(string)
@@ -342,7 +575,7 @@ func (r *runner) serviceStopOrder() []string {
 			return
 		}
 		seen[name] = true
-		task := r.cfg.Tasks[name]
+		task := m.cfg.Tasks[name]
 		if task == nil {
 			return
 		}
@@ -353,8 +586,8 @@ func (r *runner) serviceStopOrder() []string {
 			order = append(order, name)
 		}
 	}
-	names := make([]string, 0, len(r.cfg.Tasks))
-	for name := range r.cfg.Tasks {
+	names := make([]string, 0, len(m.cfg.Tasks))
+	for name := range m.cfg.Tasks {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -365,6 +598,29 @@ func (r *runner) serviceStopOrder() []string {
 		order[left], order[right] = order[right], order[left]
 	}
 	return order
+}
+
+func (m *serviceManager) shutdown() {
+	m.cancel()
+	var services []*daemonService
+	var cancels []context.CancelFunc
+	m.mu.Lock()
+	for _, inv := range m.invocations {
+		cancels = append(cancels, inv.cancel)
+	}
+	for _, svc := range m.services {
+		svc.stopping = true
+		if svc.process != nil {
+			services = append(services, svc)
+		}
+	}
+	m.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for _, svc := range services {
+		m.completeServiceStop(svc, svc.process)
+	}
 }
 
 func uniqueOwners(refs map[string]string) []string {
@@ -378,12 +634,4 @@ func uniqueOwners(refs map[string]string) []string {
 	}
 	sort.Strings(owners)
 	return owners
-}
-
-func cloneMap(source map[string]string) map[string]string {
-	clone := make(map[string]string, len(source))
-	for key, value := range source {
-		clone[key] = value
-	}
-	return clone
 }
