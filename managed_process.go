@@ -33,7 +33,7 @@ func startManagedCommand(
 ) (*managedCommand, error) {
 	executable, err := os.Executable()
 	if err != nil {
-		return nil, fmt.Errorf("locate pum executable: %w", err)
+		return nil, fmt.Errorf("locate pumice internal executable: %w", err)
 	}
 	leaseRead, leaseWrite, err := os.Pipe()
 	if err != nil {
@@ -112,20 +112,20 @@ func (p *managedCommand) stop(force bool) {
 
 func runExecSupervisor(args []string) int {
 	if len(args) != 2 {
-		fmt.Fprintln(os.Stderr, "pum: invalid internal process-supervisor invocation")
+		fmt.Fprintln(os.Stderr, "pumice-internal: invalid process-guard invocation")
 		return 2
 	}
 	root, command := args[0], args[1]
 	lease := os.NewFile(managedLeaseFD, "pum-daemon-lease")
 	if lease == nil {
-		fmt.Fprintln(os.Stderr, "pum: process supervisor has no daemon lease")
+		fmt.Fprintln(os.Stderr, "pumice-internal: process guard has no daemon lease")
 		return 125
 	}
 	defer lease.Close()
 	syscall.CloseOnExec(managedLeaseFD)
 	status := os.NewFile(managedStatusFD, "pum-command-status")
 	if status == nil {
-		fmt.Fprintln(os.Stderr, "pum: process supervisor has no status channel")
+		fmt.Fprintln(os.Stderr, "pumice-internal: process guard has no status channel")
 		return 125
 	}
 	defer status.Close()
@@ -139,7 +139,7 @@ func runExecSupervisor(args []string) int {
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "pum: start managed command: %v\n", err)
+		fmt.Fprintf(os.Stderr, "pumice-internal: start guarded command: %v\n", err)
 		return 126
 	}
 	if _, err := fmt.Fprintf(status, "%d\n", cmd.Process.Pid); err != nil {

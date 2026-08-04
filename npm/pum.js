@@ -17,7 +17,7 @@ const binary = platforms[target];
 
 if (!binary) {
   console.error(
-    `pum: unsupported platform ${target}; supported platforms are ${Object.keys(platforms).join(", ")}`
+    `pumice-internal: unsupported platform ${target}; supported platforms are ${Object.keys(platforms).join(", ")}`
   );
   process.exit(1);
 }
@@ -27,7 +27,7 @@ const result = spawnSync(path.join(__dirname, "..", "bin", binary), process.argv
 });
 
 if (result.error) {
-  console.error(`pum: ${result.error.message}`);
+  console.error(`pumice-internal: ${result.error.message}`);
   process.exit(1);
 }
 

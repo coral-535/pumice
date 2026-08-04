@@ -1,124 +1,97 @@
 # Pumice
 
-Pumice is a task runner for development services. It starts the services a task
-depends on, waits until they are healthy, reuses services that are already
-running in the same Git worktree, and stops them when they are no longer needed.
+Pumice provides worktree-scoped long-running services for Vite Task. Vite Task
+owns the task graph and runs finite commands; Pumice owns random ports,
+readiness, exact service generations, leases, and process-group cleanup.
 
-Pumice currently supports macOS and Linux on x64 and ARM64.
-
-## Process safety
-
-Pumice runs one shared, short-lived daemon per Git worktree. The daemon owns all
-task and service processes and is the lock authority for service names.
-
-- Concurrent requests for a stopped dependency share one atomic startup.
-- Locks do not depend on ports; services without a listening port are safe.
-- Closing or killing a CLI immediately releases that invocation's references.
-- If a dependency exits, the daemon stops all transitive dependent services.
-- If the daemon is killed, private process leases cause all managed process
-  groups to be killed and all connected CLI commands to exit.
-
-Different repositories always use different daemons, even when their npm
-dependencies contain different Pumice versions. Within one worktree, compatible
-package versions share a daemon based on the IPC protocol version; parallel
-version-specific daemons are intentionally prohibited. The daemon shuts down
-250 ms after its final command and service is gone, so the next invocation
-after an upgrade launches the newly installed binary.
-
-Health checks are used only to determine readiness. Process ownership and
-failure detection come from the daemon and operating-system process events.
-
-## Quick start
-
-Add a `pumice.yaml` file to your project:
-
-```yaml
-ports:
-  - DATABASE_PORT
-  - DEV_PORT
-
-tasks:
-  database:
-    lifecycle: service
-    command: my-database --port $DATABASE_PORT
-    healthcheck: database-ready --port $DATABASE_PORT
-
-  dev:
-    lifecycle: service
-    command: pnpm dev --port $DEV_PORT
-    healthcheck: curl --fail http://localhost:$DEV_PORT
-    depends_on:
-      - database
-
-  db:migrate:
-    command: pnpm db:migrate
-    depends_on:
-      - database
-```
-
-Run a task without installing Pumice:
-
-```sh
-pnpx pumice-cli run dev
-```
-
-Pumice also works with `npx`:
-
-```sh
-npx pumice-cli run dev
-```
-
-Replace `dev` with any task defined in `pumice.yaml` or `pumice.yml`:
-
-```sh
-pnpx pumice-cli run db:migrate
-```
-
-## Add Pumice to your package scripts
-
-Install Pumice as a development dependency:
-
-```sh
-pnpm add --save-dev pumice-cli
-```
-
-Or with npm:
-
-```sh
-npm install --save-dev pumice-cli
-```
-
-Then call the `pum` executable from `package.json`:
-
-```json
-{
-  "scripts": {
-    "dev": "pum run dev",
-    "db:migrate": "pum run db:migrate"
-  }
-}
-```
-
-Run the scripts with your package manager:
-
-```sh
-pnpm dev
-pnpm db:migrate
-```
-
-The equivalent npm commands are `npm run dev` and `npm run db:migrate`.
+Pumice supports macOS and Linux on x64 and ARM64.
 
 ## Configuration
 
-Pumice searches the current directory and its parents for `pumice.yaml` or
-`pumice.yml`.
+Install `pumice-cli` as a development dependency, then define services beside
+ordinary Vite tasks:
 
-- A task runs its `command` and exits.
-- A service uses `lifecycle: service` and must define a `healthcheck`.
-- `depends_on` lists tasks or services that must be ready first.
-- `ports` lists environment variables for worktree-specific ports. Pumice
-  assigns their values and makes them available to commands and health checks.
+```ts
+import { defineConfig } from 'vite-plus'
+import { definePumice } from 'pumice-cli'
 
-The daemon accepts configuration changes only while no commands or services are
-active. This prevents concurrent invocations from using different dependency
-graphs under the same worktree lock.
+const pumice = definePumice({
+  ports: ['DATABASE_PORT', 'DEV_PORT'],
+})
+
+export default defineConfig({
+  run: {
+    tasks: {
+      db: pumice.service({
+        command: 'database --port $DATABASE_PORT',
+        healthcheck: 'database-ready --port $DATABASE_PORT',
+      }),
+
+      'db:migrate': {
+        command: 'pnpm db:migrate',
+        dependsOn: ['db'],
+      },
+    },
+  },
+})
+```
+
+The key in the task map is the service name. `pumice.service()` returns a
+branded descriptor with caching disabled. During Vite Task normalization it is
+translated into an internal lease-holder command for that name.
+
+`healthcheckTimeout` may be set in milliseconds and defaults to 30 seconds:
+
+```ts
+pumice.service({
+  command: 'pnpm dev',
+  healthcheck: 'curl --fail http://127.0.0.1:$DEV_PORT/health',
+  healthcheckTimeout: 60_000,
+})
+```
+
+Service commands must remain in the foreground and must not daemonize
+themselves.
+
+## Vite Task integration contract
+
+Pumice expects Vite Task to recognize values branded with
+`Symbol.for('pumice.service')` while normalizing the completed task map.
+`normalizePumiceTasks()` is also exported for integrations that normalize a
+task map explicitly.
+
+For each required service, Vite Task must:
+
+1. Start the descriptor's generated `pumice-internal lease` command.
+2. Read the `PUMICE_READY {json}` line from stdout. The payload contains the
+   exact generation and environment values to inject into dependent tasks.
+3. Treat that process as ready while leaving it alive.
+4. Fail or cancel dependents if the process exits unexpectedly.
+5. Terminate the lease holder when the dependency is no longer required.
+
+This is a service-descriptor extension to Vite Task; releases that only support
+finite `{ command, dependsOn }` tasks cannot model the readiness/lifetime
+boundary by themselves.
+
+## Runtime model
+
+There is exactly one Pumice daemon per canonical Git worktree. Each service
+name has at most one active generation. Matching concurrent acquisitions reuse
+that exact generation; a different definition for an active name is rejected.
+
+Every acquisition has a dedicated IPC connection. Closing the connection
+releases that lease. When the final lease disappears, the daemon gracefully
+stops the service's complete process group and clears its slot. If a service
+dies, all lease holders for that generation fail. If the daemon dies, service
+guards kill their owned process groups.
+
+Ports are allocated once per daemon namespace and returned in the readiness
+payload. Separate worktrees use separate daemon namespaces and independent
+port values.
+
+## What Pumice does not do
+
+Pumice has no project YAML, user-facing task CLI, finite-task runner, dependency
+graph, task caching, or task cancellation model. Those concerns belong to Vite
+Task. `pumice-internal` is an implementation detail generated by service
+descriptors, not an end-user command.

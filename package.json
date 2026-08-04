@@ -1,7 +1,7 @@
 {
   "name": "pumice-cli",
-  "version": "0.0.4",
-  "description": "Service-aware task runner with shared development services",
+  "version": "0.1.0-alpha.0",
+  "description": "Worktree-scoped long-running services for Vite Task",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -11,22 +11,30 @@
   "bugs": {
     "url": "https://github.com/coral-535/pumice/issues"
   },
+  "main": "npm/index.js",
+  "types": "npm/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./npm/index.d.ts",
+      "default": "./npm/index.js"
+    }
+  },
   "bin": {
-    "pumice-cli": "npm/pum.js",
-    "pum": "npm/pum.js",
-    "pum-darwin-arm64": "bin/pum-darwin-arm64",
-    "pum-darwin-x64": "bin/pum-darwin-x64",
-    "pum-linux-arm64": "bin/pum-linux-arm64",
-    "pum-linux-x64": "bin/pum-linux-x64"
+    "pumice-internal": "npm/pum.js"
   },
   "files": [
     "bin/",
+    "npm/index.js",
+    "npm/index.d.ts",
     "npm/pum.js",
     "README.md",
     "LICENSE"
   ],
   "engines": {
     "node": ">=18"
+  },
+  "scripts": {
+    "test": "node npm/index.test.js"
   },
   "publishConfig": {
     "access": "public",

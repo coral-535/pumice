@@ -1,88 +1,84 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
-
-	"gopkg.in/yaml.v3"
+	"time"
 )
 
 var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-type projectConfig struct {
-	Ports    []string          `yaml:"ports"`
-	Tasks    map[string]*entry `yaml:"tasks"`
-	Root     string            `yaml:"-"`
-	Filename string            `yaml:"-"`
+// serviceDefinition is the complete, immutable description of one service
+// acquisition. Vite Task owns dependencies; Pumice deliberately has no task
+// graph or finite-command representation.
+type serviceDefinition struct {
+	Name               string   `json:"name"`
+	Command            string   `json:"command"`
+	Healthcheck        string   `json:"healthcheck"`
+	Ports              []string `json:"ports,omitempty"`
+	HealthcheckTimeout int64    `json:"healthcheckTimeout,omitempty"`
 }
 
-type entry struct {
-	Lifecycle   string   `yaml:"lifecycle"`
-	Command     string   `yaml:"command"`
-	Healthcheck string   `yaml:"healthcheck"`
-	DependsOn   []string `yaml:"depends_on"`
-}
-
-func (e *entry) isService() bool {
-	return e.Lifecycle == "service"
-}
-
-func loadProjectConfig(start string) (*projectConfig, error) {
-	filename, err := findConfig(start)
-	if err != nil {
-		return nil, err
+func (d *serviceDefinition) validate() error {
+	if strings.TrimSpace(d.Name) == "" {
+		return errors.New("service name cannot be empty")
 	}
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", filename, err)
+	if strings.TrimSpace(d.Command) == "" {
+		return fmt.Errorf("service %q must define command", d.Name)
 	}
-
-	var cfg projectConfig
-	decoder := yaml.NewDecoder(strings.NewReader(string(data)))
-	decoder.KnownFields(true)
-	if err := decoder.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", filename, err)
+	if strings.TrimSpace(d.Healthcheck) == "" {
+		return fmt.Errorf("service %q must define healthcheck", d.Name)
 	}
-	cfg.Filename = filename
-	cfg.Root, err = canonicalWorktree(filepath.Dir(filename))
-	if err != nil {
-		return nil, err
+	if d.HealthcheckTimeout < 0 {
+		return fmt.Errorf("service %q healthcheckTimeout cannot be negative", d.Name)
 	}
-	if err := cfg.validate(); err != nil {
-		return nil, fmt.Errorf("%s: %w", filename, err)
-	}
-	return &cfg, nil
-}
-
-func findConfig(start string) (string, error) {
-	dir, err := filepath.Abs(start)
-	if err != nil {
-		return "", err
-	}
-	for {
-		for _, name := range []string{"pumice.yaml", "pumice.yml"} {
-			candidate := filepath.Join(dir, name)
-			if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
-				return candidate, nil
-			}
+	seen := make(map[string]bool, len(d.Ports))
+	for _, port := range d.Ports {
+		if !environmentName.MatchString(port) {
+			return fmt.Errorf("port %q is not a valid environment variable name", port)
 		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
+		if seen[port] {
+			return fmt.Errorf("port %q is declared more than once", port)
 		}
-		dir = parent
+		seen[port] = true
 	}
-	return "", errors.New("no pumice.yaml or pumice.yml found in this directory or its parents")
+	return nil
 }
 
-func canonicalWorktree(configDir string) (string, error) {
-	cmd := exec.Command("git", "-C", configDir, "rev-parse", "--show-toplevel")
+func (d *serviceDefinition) timeout() time.Duration {
+	if d.HealthcheckTimeout == 0 {
+		return 30 * time.Second
+	}
+	return time.Duration(d.HealthcheckTimeout) * time.Millisecond
+}
+
+func (d *serviceDefinition) canonicalize() {
+	d.Ports = append([]string(nil), d.Ports...)
+	sort.Strings(d.Ports)
+}
+
+func definitionDigest(d *serviceDefinition) string {
+	clone := *d
+	clone.canonicalize()
+	data, _ := json.Marshal(&clone)
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func canonicalWorktree(start string) (string, error) {
+	abs, err := filepath.Abs(start)
+	if err != nil {
+		return "", fmt.Errorf("resolve working directory: %w", err)
+	}
+	cmd := exec.Command("git", "-C", abs, "rev-parse", "--show-toplevel")
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("determine Git worktree: %w", err)
@@ -90,80 +86,7 @@ func canonicalWorktree(configDir string) (string, error) {
 	root := strings.TrimSpace(string(out))
 	root, err = filepath.EvalSymlinks(root)
 	if err != nil {
-		return "", fmt.Errorf("canonicalize worktree: %w", err)
+		return "", fmt.Errorf("canonicalize Git worktree: %w", err)
 	}
 	return filepath.Clean(root), nil
-}
-
-func (c *projectConfig) validate() error {
-	if len(c.Tasks) == 0 {
-		return errors.New("tasks must contain at least one entry")
-	}
-	seenPorts := make(map[string]bool)
-	for _, port := range c.Ports {
-		if port == "" {
-			return errors.New("port names cannot be empty")
-		}
-		if !environmentName.MatchString(port) {
-			return fmt.Errorf("port %q is not a valid environment variable name", port)
-		}
-		if seenPorts[port] {
-			return fmt.Errorf("port %q is declared more than once", port)
-		}
-		seenPorts[port] = true
-	}
-
-	names := make([]string, 0, len(c.Tasks))
-	for name := range c.Tasks {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		task := c.Tasks[name]
-		if task == nil {
-			return fmt.Errorf("task %q has no configuration", name)
-		}
-		if name == "" {
-			return errors.New("task names cannot be empty")
-		}
-		if task.Lifecycle != "" && task.Lifecycle != "service" {
-			return fmt.Errorf("task %q has unsupported lifecycle %q", name, task.Lifecycle)
-		}
-		if strings.TrimSpace(task.Command) == "" {
-			return fmt.Errorf("task %q must define command", name)
-		}
-		if task.isService() && strings.TrimSpace(task.Healthcheck) == "" {
-			return fmt.Errorf("service %q must define healthcheck", name)
-		}
-		for _, dependency := range task.DependsOn {
-			if _, ok := c.Tasks[dependency]; !ok {
-				return fmt.Errorf("task %q depends on unknown task %q", name, dependency)
-			}
-		}
-	}
-
-	state := make(map[string]uint8)
-	var visit func(string) error
-	visit = func(name string) error {
-		switch state[name] {
-		case 1:
-			return fmt.Errorf("dependency cycle includes %q", name)
-		case 2:
-			return nil
-		}
-		state[name] = 1
-		for _, dependency := range c.Tasks[name].DependsOn {
-			if err := visit(dependency); err != nil {
-				return err
-			}
-		}
-		state[name] = 2
-		return nil
-	}
-	for _, name := range names {
-		if err := visit(name); err != nil {
-			return err
-		}
-	}
-	return nil
 }

@@ -1,85 +1,39 @@
-# Pumice Daemon Architecture Handoff
+# Pumice Rewrite Handoff
 
-## Runtime model
+Pumice is now a Vite Task service runtime, not a CLI task runner.
 
-Pumice now uses a worktree-scoped daemon instead of coordinating independent
-CLI process owners through a JSON registry.
+## Public package surface
 
-The CLI loads and validates `pumice.yaml`, connects to the daemon over a
-permission-restricted Unix socket, and proxies stdin/stdout/stderr. The daemon
-is the sole owner of:
+- `definePumice({ ports })`
+- `pumice.service({ command, healthcheck, healthcheckTimeout? })`
+- `isPumiceService(value)`
+- `normalizePumiceTasks(tasks)`
 
-- service locks, including the `starting` state;
-- active invocation references;
-- service dependency state;
-- managed ports; and
-- every task, service, and health-check process.
+The npm package exports only the JavaScript/TypeScript API and the generated
+`pumice-internal` binary shim. The old `pum`, `pumice-cli`, `pum run`, YAML
+configuration, finite commands, and Pumice-owned dependency graph are gone.
 
-The daemon exits 250 ms after its final connection and service disappear. A
-startup flock and a lifetime flock prevent daemon startup races.
+## Main runtime files
 
-Runtime identity is based on the canonical worktree, not the package version.
-This isolates different repositories while ensuring that two npm versions
-cannot create competing lock authorities in one worktree. Compatible package
-versions share the versioned IPC protocol; breaking compatibility requires a
-`protocolVersion` bump. Once a worktree becomes idle, its daemon exits and the
-next CLI invocation launches whichever package binary invoked it.
-
-## Failure guarantees
-
-Every project command runs behind the internal `_exec` supervisor. The daemon
-holds the write side of a private lease pipe and the supervisor holds the read
-side. An unexpected daemon exit closes the lease in the kernel, causing the
-supervisor to kill the command's process group. This mechanism is portable
-across the supported Unix platforms and does not rely solely on Linux parent
-death signals.
-
-The client connection is also a lease. EOF immediately cancels its invocation
-and releases all service references. An unexpected service exit is observed
-through `Wait`, not a health check; the daemon stops transitive dependent
-services and cancels every affected invocation.
-
-## Locking
-
-The daemon inserts a service record while holding its manager mutex before
-launching the process. That record is the service-name lock for startup,
-running, and shutdown; it is removed only after process-group termination
-completes. Concurrent dependency requests wait on the same readiness channel.
-A direct duplicate request fails clearly.
-
-Ports are values managed by the daemon, not locks.
-
-## Main files
-
-- `main.go`: public CLI and dispatch for internal daemon/supervisor modes.
-- `client.go`: daemon startup serialization, IPC client, and stdio proxying.
-- `daemon.go`: Unix socket server, configuration epochs, connection leases,
-  and bounded asynchronous stdin relay.
-- `runner.go`: daemon-owned service manager, atomic service locking,
-  references, health readiness, exit propagation, and shutdown ordering.
-- `managed_process.go`: process lease supervisor and process-group shutdown.
-- `registry.go`: secure worktree runtime-path derivation.
-- `protocol.go`: versioned client/daemon wire messages.
-- `runner_test.go`: black-box concurrency and crash regression tests.
+- `npm/index.js` and `npm/index.d.ts`: branded descriptor API and task-map
+  normalization.
+- `main.go`: internal lease-holder, daemon, and process-guard dispatch.
+- `client.go`: daemon startup serialization, acquisition, readiness forwarding,
+  and socket-lifetime lease.
+- `daemon.go`: worktree socket, protocol validation, and one lease per client.
+- `runner.go`: ports, slots, generations, readiness, coalescing, failures, and
+  zero-lease shutdown.
+- `managed_process.go`: daemon-death pipe and process-group cleanup.
+- `registry.go`: canonical-worktree runtime paths and private directory checks.
+- `protocol.go`: protocol v2 acquisition/readiness/failure messages.
 
 ## Verification
 
-The integration suite covers:
-
-- temporary dependency lifecycle and port injection;
-- simultaneous cold-start locking;
-- abrupt client disconnect;
-- dependency-process death;
-- daemon `SIGKILL`; and
-- dependent-before-dependency shutdown order.
-
-Run:
-
 ```sh
-go test -race ./...
-go vet ./...
-go build ./...
+GOCACHE=/tmp/pumice-go-cache go test -race ./...
+GOCACHE=/tmp/pumice-go-cache go vet ./...
+node npm/index.test.js
 ```
 
-The tests create Unix sockets and ephemeral localhost listeners, which can
-require extra permission in a restricted sandbox.
+The Go integration tests create ephemeral TCP listeners and Unix sockets, so
+they need ordinary local socket permissions in restricted sandboxes.

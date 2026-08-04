@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,61 +10,56 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
 
-func runDaemonClient(
+const readyLinePrefix = "PUMICE_READY "
+
+type readyMessage struct {
+	Type        string            `json:"type"`
+	Service     string            `json:"service"`
+	Generation  uint64            `json:"generation"`
+	Environment map[string]string `json:"environment"`
+}
+
+// runLeaseClient acquires exactly one generation and intentionally remains
+// connected until its context is cancelled or that generation fails. The
+// socket lifetime is the lease lifetime.
+func runLeaseClient(
 	ctx context.Context,
-	cfg *projectConfig,
-	name string,
-	stdin io.Reader,
-	stdout, stderr io.Writer,
+	root string,
+	definition *serviceDefinition,
+	readiness io.Writer,
 ) error {
-	conn, err := connectDaemon(cfg)
+	conn, err := connectDaemon(root)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-	finished := make(chan struct{})
-	defer close(finished)
 
-	sender := &clientSender{encoder: json.NewEncoder(conn)}
-	if err := sender.send(clientMessage{
-		Version: protocolVersion,
-		Type:    "run",
-		Name:    name,
-		Digest:  configDigest(cfg),
-		Config:  cfg,
-	}); err != nil {
-		return fmt.Errorf("send daemon request: %w", err)
+	request := clientMessage{
+		Version:    protocolVersion,
+		Type:       "acquire",
+		Definition: definition,
+		ConfigHash: definitionDigest(definition),
+	}
+	if err := json.NewEncoder(conn).Encode(&request); err != nil {
+		return fmt.Errorf("send acquisition request: %w", err)
 	}
 
-	go func() {
-		buffer := make([]byte, 32*1024)
-		for {
-			n, readErr := stdin.Read(buffer)
-			if n > 0 {
-				if err := sender.send(clientMessage{Type: "input", Data: buffer[:n]}); err != nil {
-					return
-				}
-			}
-			if readErr != nil {
-				_ = sender.send(clientMessage{Type: "input_eof"})
-				return
-			}
-		}
-	}()
+	finished := make(chan struct{})
+	defer close(finished)
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = sender.send(clientMessage{Type: "cancel"})
+			_ = conn.Close()
 		case <-finished:
 		}
 	}()
 
 	decoder := json.NewDecoder(conn)
+	ready := false
 	for {
 		var event daemonEvent
 		if err := decoder.Decode(&event); err != nil {
@@ -74,44 +67,44 @@ func runDaemonClient(
 				return ctx.Err()
 			}
 			if errors.Is(err, io.EOF) || isClosedConnection(err) {
-				return errors.New("worktree daemon stopped unexpectedly; all managed processes were terminated")
+				return errors.New("worktree daemon stopped unexpectedly; the service generation was terminated")
 			}
-			return fmt.Errorf("read daemon response: %w", err)
+			return fmt.Errorf("read daemon event: %w", err)
 		}
 		switch event.Type {
-		case "output":
-			target := stdout
-			if event.Stream == "stderr" {
-				target = stderr
+		case "ready":
+			if ready {
+				return errors.New("worktree daemon reported readiness more than once")
 			}
-			if _, err := target.Write(event.Data); err != nil {
-				return err
+			ready = true
+			message := readyMessage{
+				Type:        "ready",
+				Service:     definition.Name,
+				Generation:  event.Generation,
+				Environment: event.Environment,
 			}
-		case "done":
-			if ctx.Err() != nil {
-				return ctx.Err()
+			data, _ := json.Marshal(&message)
+			if _, err := fmt.Fprintf(readiness, "%s%s\n", readyLinePrefix, data); err != nil {
+				return fmt.Errorf("report service readiness: %w", err)
 			}
-			if event.Error != "" {
-				return errors.New(event.Error)
+		case "failed":
+			if event.Error == "" {
+				event.Error = fmt.Sprintf("service %q generation %d failed", definition.Name, event.Generation)
 			}
-			return nil
+			return errors.New(event.Error)
+		case "error":
+			if event.Error == "" {
+				event.Error = "worktree daemon rejected the service acquisition"
+			}
+			return errors.New(event.Error)
+		default:
+			return fmt.Errorf("worktree daemon sent unknown event %q", event.Type)
 		}
 	}
 }
 
-type clientSender struct {
-	mu      sync.Mutex
-	encoder *json.Encoder
-}
-
-func (s *clientSender) send(message clientMessage) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.encoder.Encode(&message)
-}
-
-func connectDaemon(cfg *projectConfig) (net.Conn, error) {
-	paths, err := newRuntimePaths(cfg.Root)
+func connectDaemon(root string) (net.Conn, error) {
+	paths, err := newRuntimePaths(root)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +125,7 @@ func connectDaemon(cfg *projectConfig) (net.Conn, error) {
 	if conn, err := net.DialTimeout("unix", paths.socket, 100*time.Millisecond); err == nil {
 		return conn, nil
 	}
-	if err := startDaemonProcess(cfg.Root, paths.log); err != nil {
+	if err := startDaemonProcess(root, paths.log); err != nil {
 		return nil, err
 	}
 
@@ -156,19 +149,18 @@ func connectDaemon(cfg *projectConfig) (net.Conn, error) {
 func startDaemonProcess(root, logPath string) error {
 	executable, err := os.Executable()
 	if err != nil {
-		return fmt.Errorf("locate pum executable: %w", err)
+		return fmt.Errorf("locate pumice executable: %w", err)
 	}
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("open daemon log: %w", err)
 	}
 	cmd := exec.Command(executable, "_daemon", root)
-	cmd.Stdin = nil
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
-		logFile.Close()
+		_ = logFile.Close()
 		return fmt.Errorf("start worktree daemon: %w", err)
 	}
 	_ = logFile.Close()
@@ -176,12 +168,6 @@ func startDaemonProcess(root, logPath string) error {
 		return fmt.Errorf("detach worktree daemon: %w", err)
 	}
 	return nil
-}
-
-func configDigest(cfg *projectConfig) string {
-	data, _ := json.Marshal(cfg)
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
 }
 
 func readDaemonLog(filename string) string {

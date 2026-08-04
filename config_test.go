@@ -5,83 +5,43 @@ import (
 	"testing"
 )
 
-func TestConfigValidation(t *testing.T) {
+func TestServiceDefinitionValidation(t *testing.T) {
 	tests := []struct {
-		name    string
-		config  projectConfig
-		wantErr string
+		name       string
+		definition serviceDefinition
+		wantError  string
 	}{
 		{
 			name: "valid",
-			config: projectConfig{
-				Ports: []string{"DB_PORT"},
-				Tasks: map[string]*entry{
-					"db":      {Lifecycle: "service", Command: "db", Healthcheck: "check"},
-					"migrate": {Command: "migrate", DependsOn: []string{"db"}},
-				},
+			definition: serviceDefinition{
+				Name: "db", Command: "database", Healthcheck: "database-ready", Ports: []string{"DB_PORT"},
 			},
 		},
-		{
-			name: "service needs healthcheck",
-			config: projectConfig{
-				Tasks: map[string]*entry{
-					"db": {Lifecycle: "service", Command: "db"},
-				},
-			},
-			wantErr: "must define healthcheck",
-		},
-		{
-			name: "port must be an environment name",
-			config: projectConfig{
-				Ports: []string{"NOT-A-VARIABLE"},
-				Tasks: map[string]*entry{"task": {Command: "true"}},
-			},
-			wantErr: "valid environment variable",
-		},
-		{
-			name: "unknown dependency",
-			config: projectConfig{
-				Tasks: map[string]*entry{
-					"dev": {Command: "dev", DependsOn: []string{"missing"}},
-				},
-			},
-			wantErr: "unknown task",
-		},
-		{
-			name: "cycle",
-			config: projectConfig{
-				Tasks: map[string]*entry{
-					"a": {Command: "a", DependsOn: []string{"b"}},
-					"b": {Command: "b", DependsOn: []string{"a"}},
-				},
-			},
-			wantErr: "dependency cycle",
-		},
+		{name: "missing name", definition: serviceDefinition{Command: "db", Healthcheck: "true"}, wantError: "name cannot be empty"},
+		{name: "missing command", definition: serviceDefinition{Name: "db", Healthcheck: "true"}, wantError: "must define command"},
+		{name: "missing healthcheck", definition: serviceDefinition{Name: "db", Command: "db"}, wantError: "must define healthcheck"},
+		{name: "invalid port", definition: serviceDefinition{Name: "db", Command: "db", Healthcheck: "true", Ports: []string{"BAD-PORT"}}, wantError: "valid environment"},
+		{name: "duplicate port", definition: serviceDefinition{Name: "db", Command: "db", Healthcheck: "true", Ports: []string{"PORT", "PORT"}}, wantError: "more than once"},
+		{name: "negative timeout", definition: serviceDefinition{Name: "db", Command: "db", Healthcheck: "true", HealthcheckTimeout: -1}, wantError: "cannot be negative"},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := test.config.validate()
-			if test.wantErr == "" && err != nil {
+			err := test.definition.validate()
+			if test.wantError == "" && err != nil {
 				t.Fatalf("validate() error = %v", err)
 			}
-			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
-				t.Fatalf("validate() error = %v, want containing %q", err, test.wantErr)
+			if test.wantError != "" && (err == nil || !strings.Contains(err.Error(), test.wantError)) {
+				t.Fatalf("validate() error = %v, want containing %q", err, test.wantError)
 			}
 		})
 	}
 }
 
-func TestYAMLConfigRejectsUnknownFields(t *testing.T) {
-	root := initTestRepo(t)
-	writeTestFile(t, root+"/pumice.yaml", `
-tasks:
-  hello:
-    command: echo hello
-    typo: true
-`)
-	_, err := loadProjectConfig(root)
-	if err == nil || !strings.Contains(err.Error(), "field typo not found") {
-		t.Fatalf("loadProjectConfig() error = %v", err)
+func TestDefinitionDigestCanonicalizesPortOrder(t *testing.T) {
+	left := &serviceDefinition{Name: "db", Command: "db", Healthcheck: "true", Ports: []string{"Z_PORT", "A_PORT"}}
+	right := &serviceDefinition{Name: "db", Command: "db", Healthcheck: "true", Ports: []string{"A_PORT", "Z_PORT"}}
+	if definitionDigest(left) != definitionDigest(right) {
+		t.Fatal("equivalent port sets produced different service definition hashes")
 	}
 }
