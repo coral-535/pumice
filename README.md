@@ -1,124 +1,90 @@
 # Pumice
 
-Pumice is a task runner for development services. It starts the services a task
-depends on, waits until they are healthy, reuses services that are already
-running in the same Git worktree, and stops them when they are no longer needed.
+Pumice keeps worktree-scoped development services alive while a finite command
+uses them. One daemon directly owns the service process groups. A
+`ServiceGuard` connection owns the references acquired through it, and closing
+that connection releases them atomically.
 
-Pumice currently supports macOS and Linux on x64 and ARM64.
+Both resources surrounding a run are async-disposable:
 
-## Process safety
+```js
+import { ServiceGuard, startCommand } from "pumice-cli/core";
 
-Pumice runs one shared, short-lived daemon per Git worktree. The daemon owns all
-task and service processes and is the lock authority for service names.
+await using guard = await ServiceGuard.connect(process.cwd());
+await guard.run({
+  services: [
+    {
+      name: "database",
+      command: "database --port 5432",
+      healthcheck: "database-ready --port 5432",
+    },
+  ],
+});
 
-- Concurrent requests for a stopped dependency share one atomic startup.
-- Locks do not depend on ports; services without a listening port are safe.
-- Closing or killing a CLI immediately releases that invocation's references.
-- If a dependency exits, the daemon stops all transitive dependent services.
-- If the daemon is killed, private process leases cause all managed process
-  groups to be killed and all connected CLI commands to exit.
-
-Different repositories always use different daemons, even when their npm
-dependencies contain different Pumice versions. Within one worktree, compatible
-package versions share a daemon based on the IPC protocol version; parallel
-version-specific daemons are intentionally prohibited. The daemon shuts down
-250 ms after its final command and service is gone, so the next invocation
-after an upgrade launches the newly installed binary.
-
-Health checks are used only to determine readiness. Process ownership and
-failure detection come from the daemon and operating-system process events.
-
-## Quick start
-
-Add a `pumice.yaml` file to your project:
-
-```yaml
-ports:
-  - DATABASE_PORT
-  - DEV_PORT
-
-tasks:
-  database:
-    lifecycle: service
-    command: my-database --port $DATABASE_PORT
-    healthcheck: database-ready --port $DATABASE_PORT
-
-  dev:
-    lifecycle: service
-    command: pnpm dev --port $DEV_PORT
-    healthcheck: curl --fail http://localhost:$DEV_PORT
-    depends_on:
-      - database
-
-  db:migrate:
-    command: pnpm db:migrate
-    depends_on:
-      - database
+await using command = startCommand("pnpm test");
+const outcome = await Promise.race([
+  command.exited,
+  guard.failure.then((error) => {
+    throw error;
+  }),
+]);
 ```
 
-Run a task without installing Pumice:
+`run()` provides the complete policy: it waits for service readiness, starts
+the command, terminates the command's process group if a required service dies,
+waits for that group to exit, and finally releases the guard.
+
+```js
+import { run } from "pumice-cli/core";
+
+const result = await run(
+  process.cwd(),
+  { services: [{ name: "database", command: "database", healthcheck: "database-ready" }] },
+  { command: "pnpm test" },
+);
+```
+
+Services with the same name and definition share one generation. Acquiring an
+active name with a different definition fails. Unexpected service exits and
+daemon disconnects are terminal for every affected guard. There is no automatic
+restart policy.
+
+Pumice currently uses POSIX process groups for descendant cleanup. On Windows,
+termination is limited to the direct child until Job Object containment is
+implemented.
+
+## Development
+
+The project uses the Vite+ TypeScript library structure:
 
 ```sh
-pnpx pumice-cli run dev
+vp install
+vp check
+vp test
+vp pack
 ```
 
-Pumice also works with `npx`:
+`vp pack` emits the library, generated declarations, source maps, and the
+`pumice-daemon` executable into `dist/`.
+
+Pre-commit checks are installed by `vp config --no-agent`. The committed
+`.vite-hooks/pre-commit` hook runs `vp staged`, which applies `vp check --fix`
+to staged files using `vite.config.ts`.
+
+## Publishing
+
+Update the version with `vp run bump`, then choose one of the Vite+ publishing
+flows:
 
 ```sh
-npx pumice-cli run dev
+# Build and publish directly through the detected package manager
+vp run release
+
+# Upload a CI-friendly staged release, then approve it from a trusted device
+vp run release:stage
+vp pm stage list
+vp pm stage approve <stage-id>
 ```
 
-Replace `dev` with any task defined in `pumice.yaml` or `pumice.yml`:
-
-```sh
-pnpx pumice-cli run db:migrate
-```
-
-## Add Pumice to your package scripts
-
-Install Pumice as a development dependency:
-
-```sh
-pnpm add --save-dev pumice-cli
-```
-
-Or with npm:
-
-```sh
-npm install --save-dev pumice-cli
-```
-
-Then call the `pum` executable from `package.json`:
-
-```json
-{
-  "scripts": {
-    "dev": "pum run dev",
-    "db:migrate": "pum run db:migrate"
-  }
-}
-```
-
-Run the scripts with your package manager:
-
-```sh
-pnpm dev
-pnpm db:migrate
-```
-
-The equivalent npm commands are `npm run dev` and `npm run db:migrate`.
-
-## Configuration
-
-Pumice searches the current directory and its parents for `pumice.yaml` or
-`pumice.yml`.
-
-- A task runs its `command` and exits.
-- A service uses `lifecycle: service` and must define a `healthcheck`.
-- `depends_on` lists tasks or services that must be ready first.
-- `ports` lists environment variables for worktree-specific ports. Pumice
-  assigns their values and makes them available to commands and health checks.
-
-The daemon accepts configuration changes only while no commands or services are
-active. This prevents concurrent invocations from using different dependency
-graphs under the same worktree lock.
+Both release scripts run checks, tests, and `vp pack` first. Publishing also
+invokes `prepublishOnly`, ensuring `dist/` is rebuilt from the tagged source.

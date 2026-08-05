@@ -1,35 +1,66 @@
 {
   "name": "pumice-cli",
-  "version": "0.0.4",
-  "description": "Service-aware task runner with shared development services",
+  "version": "0.1.0-alpha.0",
+  "description": "Worktree-scoped service guards for finite commands",
+  "homepage": "https://github.com/coral-535/pumice#readme",
+  "bugs": {
+    "url": "https://github.com/coral-535/pumice/issues"
+  },
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/coral-535/pumice.git"
   },
-  "homepage": "https://github.com/coral-535/pumice#readme",
-  "bugs": {
-    "url": "https://github.com/coral-535/pumice/issues"
-  },
   "bin": {
-    "pumice-cli": "npm/pum.js",
-    "pum": "npm/pum.js",
-    "pum-darwin-arm64": "bin/pum-darwin-arm64",
-    "pum-darwin-x64": "bin/pum-darwin-x64",
-    "pum-linux-arm64": "bin/pum-linux-arm64",
-    "pum-linux-x64": "bin/pum-linux-x64"
+    "pumice-daemon": "./dist/daemon-cli.mjs"
   },
   "files": [
-    "bin/",
-    "npm/pum.js",
+    "dist",
     "README.md",
     "LICENSE"
   ],
-  "engines": {
-    "node": ">=18"
+  "type": "module",
+  "types": "./dist/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    },
+    "./core": {
+      "types": "./dist/core.d.mts",
+      "import": "./dist/core.mjs"
+    },
+    "./package.json": "./package.json"
   },
   "publishConfig": {
-    "access": "public",
-    "registry": "https://registry.npmjs.org"
+    "access": "public"
+  },
+  "scripts": {
+    "build": "vp pack",
+    "dev": "vp pack --watch",
+    "test": "vp test",
+    "check": "vp check",
+    "bump": "vp exec bumpp",
+    "release": "vp check && vp test && vp run build && vp pm publish",
+    "release:stage": "vp check && vp test && vp run build && vp pm stage publish",
+    "prepublishOnly": "vp run build",
+    "prepare": "vp config --no-agent"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "bumpp": "^11.1.0",
+    "typescript": "^7.0.2",
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "11.20.0",
+      "onFail": "download"
+    }
+  },
+  "engines": {
+    "node": ">=24"
   }
 }
