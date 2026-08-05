@@ -1,41 +1,81 @@
 import { mkdir, rm } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
-import { deferred } from "./deferred.js";
-import { definitionFingerprint, normalizePlan } from "./definitions.js";
-import { ServiceConfigurationError, ServiceStartupError, serializeError } from "./errors.js";
-import { JsonLineChannel } from "./ipc.js";
-import { Service } from "./service.js";
+import { deferred, type Deferred } from "./deferred.ts";
+import {
+  definitionFingerprint,
+  normalizePlan,
+  type NormalizedServiceDefinition,
+} from "./definitions.ts";
+import { ServiceConfigurationError, ServiceStartupError, serializeError } from "./errors.ts";
+import { JsonLineChannel } from "./ipc.ts";
+import type { ProcessResult } from "./process.ts";
+import { Service } from "./service.ts";
+
+export interface DaemonServerOptions {
+  socketPath: string;
+  idleTimeout?: number | null;
+}
+
+export interface AcquiredPlan {
+  services: Array<{ name: string; generation: number }>;
+}
+
+interface DaemonConnection {
+  channel: JsonLineChannel;
+  references: Map<string, ServiceRecord>;
+  closed: boolean;
+}
+
+interface ServiceRecord {
+  definition: NormalizedServiceDefinition;
+  fingerprint: string;
+  generation: number;
+  service: Service;
+  state: "starting" | "ready" | "stopping";
+  connections: Set<DaemonConnection>;
+  ready: Promise<void>;
+}
+
+interface AcquireResult {
+  added: boolean;
+  record: ServiceRecord;
+  publicRecord: { name: string; generation: number };
+}
 
 export class DaemonServer {
-  #connections = new Set();
-  #services = new Map();
-  #nextGeneration = 1;
-  #server;
-  #closing = false;
-  #closePromise;
-  #idleTimer;
+  readonly socketPath: string;
+  readonly idleTimeout: number | null;
+  readonly closed: Promise<void>;
 
-  constructor(options) {
+  #connections = new Set<DaemonConnection>();
+  #services = new Map<string, ServiceRecord>();
+  #nextGeneration = 1;
+  #server: Server | undefined;
+  #closing = false;
+  #closePromise: Promise<void> | undefined;
+  #idleTimer: NodeJS.Timeout | undefined;
+  #closed: Deferred<void>;
+
+  constructor(options: DaemonServerOptions) {
     if (!options?.socketPath) throw new TypeError("socketPath is required");
     this.socketPath = options.socketPath;
     this.idleTimeout = options.idleTimeout ?? null;
-    this.#closed = deferred();
+    this.#closed = deferred<void>();
     this.closed = this.#closed.promise;
   }
 
-  #closed;
-
-  async listen() {
+  async listen(): Promise<this> {
     if (this.#server) throw new Error("daemon is already listening");
     await mkdir(dirname(this.socketPath), { recursive: true, mode: 0o700 });
     await rm(this.socketPath, { force: true });
-    this.#server = createServer((socket) => this.#accept(socket));
-    await new Promise((resolve, reject) => {
-      const onError = (error) => reject(error);
-      this.#server.once("error", onError);
-      this.#server.listen(this.socketPath, () => {
-        this.#server.off("error", onError);
+    const server = createServer((socket) => this.#accept(socket));
+    this.#server = server;
+    await new Promise<void>((resolve, reject) => {
+      const onError = (error: Error) => reject(error);
+      server.once("error", onError);
+      server.listen(this.socketPath, () => {
+        server.off("error", onError);
         resolve();
       });
     });
@@ -43,27 +83,27 @@ export class DaemonServer {
     return this;
   }
 
-  get serviceCount() {
+  get serviceCount(): number {
     return this.#services.size;
   }
 
-  get connectionCount() {
+  get connectionCount(): number {
     return this.#connections.size;
   }
 
-  close() {
-    if (!this.#closePromise) this.#closePromise = this.#performClose();
+  close(): Promise<void> {
+    this.#closePromise ??= this.#performClose();
     return this.#closePromise;
   }
 
-  async #performClose() {
+  async #performClose(): Promise<void> {
     this.#closing = true;
     clearTimeout(this.#idleTimer);
 
     for (const connection of this.#connections) connection.channel.destroy();
     this.#connections.clear();
 
-    const stopping = [];
+    const stopping: Promise<unknown>[] = [];
     for (const record of this.#services.values()) {
       record.state = "stopping";
       stopping.push(record.service[Symbol.asyncDispose]());
@@ -73,16 +113,17 @@ export class DaemonServer {
     await Promise.allSettled(stopping);
 
     if (this.#server) {
-      await new Promise((resolve) => this.#server.close(() => resolve()));
+      const server = this.#server;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
       this.#server = undefined;
     }
     await rm(this.socketPath, { force: true });
-    this.#closed.resolve();
+    this.#closed.resolve(undefined);
   }
 
-  #accept(socket) {
+  #accept(socket: Socket): void {
     clearTimeout(this.#idleTimer);
-    const connection = {
+    const connection: DaemonConnection = {
       channel: new JsonLineChannel(socket),
       references: new Map(),
       closed: false,
@@ -92,13 +133,15 @@ export class DaemonServer {
     connection.channel.onClose(() => this.#connectionClosed(connection));
   }
 
-  async #handleMessage(connection, message) {
-    if (message?.type !== "request" || !Number.isSafeInteger(message.id)) return;
+  async #handleMessage(connection: DaemonConnection, input: unknown): Promise<void> {
+    const message = asRecord(input);
+    if (message.type !== "request" || !Number.isSafeInteger(message.id)) return;
+    const id = message.id as number;
     try {
-      let result;
+      let result: unknown;
       switch (message.method) {
         case "acquire-plan":
-          result = await this.#acquirePlan(connection, message.params?.plan);
+          result = await this.#acquirePlan(connection, asRecord(message.params).plan);
           break;
         case "ping":
           result = { protocol: 1 };
@@ -106,21 +149,16 @@ export class DaemonServer {
         default:
           throw new TypeError(`unknown daemon method ${JSON.stringify(message.method)}`);
       }
-      connection.channel.send({ type: "response", id: message.id, ok: true, result });
+      connection.channel.send({ type: "response", id, ok: true, result });
     } catch (error) {
-      connection.channel.send({
-        type: "response",
-        id: message.id,
-        ok: false,
-        error: serializeError(error),
-      });
+      connection.channel.send({ type: "response", id, ok: false, error: serializeError(error) });
     }
   }
 
-  async #acquirePlan(connection, input) {
+  async #acquirePlan(connection: DaemonConnection, input: unknown): Promise<AcquiredPlan> {
     const plan = normalizePlan(input);
-    const added = [];
-    const acquired = [];
+    const added: ServiceRecord[] = [];
+    const acquired: AcquiredPlan["services"] = [];
     try {
       for (const definition of plan.services) {
         const result = await this.#acquire(connection, definition);
@@ -134,7 +172,10 @@ export class DaemonServer {
     }
   }
 
-  async #acquire(connection, definition) {
+  async #acquire(
+    connection: DaemonConnection,
+    definition: NormalizedServiceDefinition,
+  ): Promise<AcquireResult> {
     const fingerprint = definitionFingerprint(definition);
     let record = this.#services.get(definition.name);
     if (record && record.fingerprint !== fingerprint) {
@@ -163,25 +204,25 @@ export class DaemonServer {
     };
   }
 
-  #startRecord(definition, fingerprint) {
+  #startRecord(definition: NormalizedServiceDefinition, fingerprint: string): ServiceRecord {
     const generation = this.#nextGeneration++;
     const service = Service.start(definition, generation);
-    const record = {
+    const record: ServiceRecord = {
       definition,
       fingerprint,
       generation,
       service,
       state: "starting",
       connections: new Set(),
-      ready: undefined,
+      ready: Promise.resolve(),
     };
 
-    service.exited.then((result) => this.#serviceExited(record, result));
+    void service.exited.then((result) => this.#serviceExited(record, result));
     record.ready = service.waitUntilHealthy().then(
       () => {
         if (this.#services.get(definition.name) === record) record.state = "ready";
       },
-      async (error) => {
+      async (error: unknown) => {
         if (this.#services.get(definition.name) === record) {
           this.#services.delete(definition.name);
         }
@@ -200,7 +241,7 @@ export class DaemonServer {
     return record;
   }
 
-  #serviceExited(record, result) {
+  #serviceExited(record: ServiceRecord, result: ProcessResult): void {
     if (record.state !== "ready") return;
     if (this.#services.get(record.definition.name) !== record) return;
 
@@ -222,16 +263,16 @@ export class DaemonServer {
     this.#scheduleIdleShutdown();
   }
 
-  #connectionClosed(connection) {
+  #connectionClosed(connection: DaemonConnection): void {
     if (connection.closed) return;
     connection.closed = true;
     this.#connections.delete(connection);
-    for (const record of [...connection.references.values()]) this.#release(connection, record);
+    for (const record of connection.references.values()) this.#release(connection, record);
     connection.references.clear();
     this.#scheduleIdleShutdown();
   }
 
-  #release(connection, record) {
+  #release(connection: DaemonConnection, record: ServiceRecord): void {
     if (connection.references.get(record.definition.name) !== record) return;
     connection.references.delete(record.definition.name);
     record.connections.delete(connection);
@@ -243,11 +284,15 @@ export class DaemonServer {
     void record.service[Symbol.asyncDispose]().finally(() => this.#scheduleIdleShutdown());
   }
 
-  #scheduleIdleShutdown() {
+  #scheduleIdleShutdown(): void {
     if (this.#closing || this.idleTimeout === null) return;
     clearTimeout(this.#idleTimer);
     if (this.#connections.size !== 0 || this.#services.size !== 0) return;
     this.#idleTimer = setTimeout(() => void this.close(), this.idleTimeout);
     this.#idleTimer.unref?.();
   }
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 }

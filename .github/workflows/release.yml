@@ -22,17 +22,19 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v6
 
-      - name: Set up Node
-        uses: actions/setup-node@v6
+      - name: Set up Vite+
+        uses: voidzero-dev/setup-vp@v1
         with:
           node-version: "24"
-          registry-url: https://registry.npmjs.org
-          package-manager-cache: false
+          cache: true
+
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
 
       - name: Set version
         run: |
           version="${GITHUB_REF_NAME#v}"
-          npm version "$version" --no-git-tag-version --allow-same-version
+          vp pm version "$version" --no-git-tag-version --allow-same-version
 
           if [[ "$version" == *-* ]]; then
             prerelease="${version#*-}"
@@ -47,11 +49,17 @@ jobs:
           echo "NPM_TAG=$npm_tag" >> "$GITHUB_ENV"
           echo "IS_PRERELEASE=$is_prerelease" >> "$GITHUB_ENV"
 
+      - name: Check
+        run: vp check
+
       - name: Test
-        run: npm test
+        run: vp test
+
+      - name: Pack
+        run: vp pack
 
       - name: Publish package
-        run: npm publish --tag "$NPM_TAG"
+        run: vp pm publish --tag "$NPM_TAG" --provenance --no-git-checks
 
       - name: Create GitHub release
         env:

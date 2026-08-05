@@ -3,7 +3,7 @@ import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import test from "node:test";
+import { test } from "vite-plus/test";
 import {
   DaemonDisconnectedError,
   DaemonServer,
@@ -13,8 +13,11 @@ import {
   ServiceStartupError,
   run,
   startCommand,
-} from "../src/index.js";
-import { resolveRuntime } from "../src/runtime.js";
+  type DaemonEvent,
+  type ServiceDefinition,
+  type ServiceGuardOptions,
+} from "../src/index.ts";
+import { resolveRuntime } from "../src/runtime.ts";
 
 const FIXTURES = fileURLToPath(new URL("fixtures/", import.meta.url));
 const SERVICE_FIXTURE = join(FIXTURES, "service.js");
@@ -46,16 +49,15 @@ test("RunningCommand disposal escalates after its grace period", async () => {
   await new Promise((resolve) => setTimeout(resolve, 80));
 
   const before = Date.now();
-  await Promise.all([
-    command[Symbol.asyncDispose](),
-    command[Symbol.asyncDispose](),
-  ]);
+  await Promise.all([command[Symbol.asyncDispose](), command[Symbol.asyncDispose]()]);
   await command.exited;
 
   assert.ok(Date.now() - before >= 30);
+  assert.notEqual(command.pid, undefined);
+  const pid = command.pid as number;
   assert.throws(
-    () => process.kill(-command.pid, 0),
-    (error) => error?.code === "ESRCH",
+    () => process.kill(-pid, 0),
+    (error: unknown) => (error as NodeJS.ErrnoException).code === "ESRCH",
   );
 });
 
@@ -111,15 +113,18 @@ test("a late service exit reaches listeners and resolves guard.failure", async (
   await using fixture = await daemonFixture();
   await using guard = await fixture.connect();
   const definition = serviceDefinition(fixture.path, { exitDelay: 250 });
-  const events = [];
-  using listener = guard.onEvent((event) => events.push(event));
+  const events: DaemonEvent[] = [];
+  using _listener = guard.onEvent((event) => events.push(event));
 
   await guard.run([definition]);
   const failure = await guard.failure;
 
   assert.ok(failure instanceof ServiceExitedError);
   assert.equal(failure.exitCode, 23);
-  assert.deepEqual(events.map((event) => event.type), ["service-exited"]);
+  assert.deepEqual(
+    events.map((event) => event.type),
+    ["service-exited"],
+  );
 });
 
 test("run disposes and awaits the command before releasing the guard", async () => {
@@ -169,15 +174,18 @@ test("unexpected daemon closure is a terminal guard failure", async () => {
   await using fixture = await daemonFixture();
   await using guard = await fixture.connect();
   const definition = serviceDefinition(fixture.path);
-  const events = [];
-  using listener = guard.onEvent((event) => events.push(event));
+  const events: DaemonEvent[] = [];
+  using _listener = guard.onEvent((event) => events.push(event));
   await guard.run([definition]);
 
   await fixture.daemon.close();
   const failure = await guard.failure;
 
   assert.ok(failure instanceof DaemonDisconnectedError);
-  assert.deepEqual(events.map((event) => event.type), ["daemon-disconnected"]);
+  assert.deepEqual(
+    events.map((event) => event.type),
+    ["daemon-disconnected"],
+  );
 });
 
 test("ServiceGuard starts and retires the canonical worktree daemon", async () => {
@@ -191,7 +199,22 @@ test("ServiceGuard starts and retires the canonical worktree daemon", async () =
   await waitForMissing(runtime.lockPath, 3_000);
 });
 
-function serviceDefinition(directory, options = {}) {
+interface TestServiceDefinition extends ServiceDefinition {
+  stoppedPath: string;
+}
+
+interface ServiceDefinitionOptions {
+  suffix?: string;
+  name?: string;
+  readyDelay?: number;
+  exitDelay?: number;
+  healthcheckTimeout?: number;
+}
+
+function serviceDefinition(
+  directory: string,
+  options: ServiceDefinitionOptions = {},
+): TestServiceDefinition {
   const suffix = options.suffix ?? "service";
   const readyPath = join(directory, `${suffix}.ready`);
   const pidPath = join(directory, `${suffix}.pid`);
@@ -217,7 +240,7 @@ async function daemonFixture() {
   const temporary = await temporaryDirectory();
   const socketPath = join(temporary.path, "daemon.sock");
   const daemon = await new DaemonServer({ socketPath }).listen();
-  const connectionOptions = { socketPath, startDaemon: false };
+  const connectionOptions: ServiceGuardOptions = { socketPath, startDaemon: false };
   return {
     path: temporary.path,
     daemon,
@@ -240,15 +263,15 @@ async function temporaryDirectory() {
   };
 }
 
-function nodeCommand(script, ...arguments_) {
+function nodeCommand(script: string, ...arguments_: string[]): string {
   return [process.execPath, script, ...arguments_].map(shellQuote).join(" ");
 }
 
-function shellQuote(value) {
+function shellQuote(value: string): string {
   return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
-async function waitForFile(path, timeout = 2_000) {
+async function waitForFile(path: string, timeout = 2_000): Promise<void> {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     if (await fileExists(path)) return;
@@ -257,7 +280,7 @@ async function waitForFile(path, timeout = 2_000) {
   throw new Error(`timed out waiting for ${path}`);
 }
 
-async function waitForMissing(path, timeout) {
+async function waitForMissing(path: string, timeout: number): Promise<void> {
   const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     if (!(await fileExists(path))) return;
@@ -266,7 +289,7 @@ async function waitForMissing(path, timeout) {
   throw new Error(`timed out waiting for ${path} to disappear`);
 }
 
-async function fileExists(path) {
+async function fileExists(path: string): Promise<boolean> {
   try {
     await access(path);
     return true;

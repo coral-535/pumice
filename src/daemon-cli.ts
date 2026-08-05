@@ -2,8 +2,8 @@
 
 import { mkdir, rm } from "node:fs/promises";
 import { dirname } from "node:path";
-import { DaemonServer } from "../src/daemon.js";
-import { acquireDaemonLock } from "../src/runtime.js";
+import { DaemonServer } from "./daemon.ts";
+import { acquireDaemonLock } from "./runtime.ts";
 
 const options = parseArguments(process.argv.slice(2));
 await mkdir(dirname(options.lockPath), { recursive: true, mode: 0o700 });
@@ -24,10 +24,10 @@ try {
   await rm(options.lockPath, { force: true });
 }
 
-function parseArguments(arguments_) {
-  const values = new Map();
+function parseArguments(arguments_: string[]): { socketPath: string; lockPath: string } {
+  const values = new Map<string, string | undefined>();
   for (let index = 0; index < arguments_.length; index += 2) {
-    values.set(arguments_[index], arguments_[index + 1]);
+    values.set(arguments_[index]!, arguments_[index + 1]);
   }
   const socketPath = values.get("--socket");
   const lockPath = values.get("--lock");

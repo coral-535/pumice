@@ -1,13 +1,20 @@
-import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { open, readFile, realpath, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { open, readFile, realpath, rm, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-export async function resolveRuntime(worktreePath = process.cwd()) {
+export interface RuntimePaths {
+  worktree: string;
+  directory: string;
+  socketPath: string;
+  lockPath: string;
+}
+
+export async function resolveRuntime(worktreePath = process.cwd()): Promise<RuntimePaths> {
   const canonicalPath = await realpath(worktreePath);
   const worktree = await findWorktreeRoot(canonicalPath);
   const identity = createHash("sha256").update(worktree).digest("hex").slice(0, 24);
@@ -21,7 +28,7 @@ export async function resolveRuntime(worktreePath = process.cwd()) {
   };
 }
 
-async function findWorktreeRoot(path) {
+async function findWorktreeRoot(path: string): Promise<string> {
   try {
     const { stdout } = await execFileAsync("git", ["-C", path, "rev-parse", "--show-toplevel"], {
       encoding: "utf8",
@@ -32,14 +39,14 @@ async function findWorktreeRoot(path) {
   }
 }
 
-export async function acquireDaemonLock(lockPath) {
+export async function acquireDaemonLock(lockPath: string): Promise<FileHandle | null> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const handle = await open(lockPath, "wx", 0o600);
       await handle.writeFile(`${process.pid}\n`);
       return handle;
     } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       if (await lockOwnerIsAlive(lockPath)) return null;
       await rm(lockPath, { force: true });
     }
@@ -47,8 +54,8 @@ export async function acquireDaemonLock(lockPath) {
   return null;
 }
 
-async function lockOwnerIsAlive(lockPath) {
-  let pid;
+async function lockOwnerIsAlive(lockPath: string): Promise<boolean> {
+  let pid: number;
   try {
     pid = Number.parseInt(await readFile(lockPath, "utf8"), 10);
   } catch {
@@ -59,6 +66,6 @@ async function lockOwnerIsAlive(lockPath) {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    return error?.code === "EPERM";
+    return (error as NodeJS.ErrnoException).code === "EPERM";
   }
 }

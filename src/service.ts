@@ -1,13 +1,28 @@
-import { ServiceStartupError } from "./errors.js";
-import { normalizeServiceDefinition } from "./definitions.js";
-import { ManagedProcess, sleep } from "./process.js";
+import {
+  normalizeServiceDefinition,
+  type NormalizedServiceDefinition,
+  type ServiceDefinition,
+} from "./definitions.ts";
+import { ServiceStartupError } from "./errors.ts";
+import { ManagedProcess, sleep, type ProcessResult } from "./process.ts";
 
 const HEALTHCHECK_INTERVAL = 100;
 
-export class Service {
-  #process;
+type HealthcheckOutcome =
+  | { type: "check"; result: ProcessResult }
+  | { type: "service"; result: ProcessResult }
+  | { type: "timeout" };
 
-  constructor(definition, generation) {
+export class Service implements AsyncDisposable {
+  readonly definition: NormalizedServiceDefinition;
+  readonly key: string;
+  readonly generation: number;
+  readonly pid: number | undefined;
+  readonly exited: Promise<ProcessResult>;
+
+  #process: ManagedProcess;
+
+  constructor(definition: NormalizedServiceDefinition, generation: number) {
     this.definition = definition;
     this.key = definition.name;
     this.generation = generation;
@@ -20,15 +35,19 @@ export class Service {
     this.exited = this.#process.exited;
   }
 
-  static start(definition, generation) {
+  static start(
+    definition: ServiceDefinition | NormalizedServiceDefinition,
+    generation: number,
+  ): Service {
     return new Service(normalizeServiceDefinition(definition), generation);
   }
 
-  async waitUntilHealthy() {
+  async waitUntilHealthy(): Promise<void> {
     try {
       await this.#process.spawned;
     } catch (error) {
-      throw new ServiceStartupError(this.key, error.message, { cause: error });
+      const cause = error instanceof Error ? error : new Error(String(error));
+      throw new ServiceStartupError(this.key, cause.message, { cause });
     }
     if (!this.definition.healthcheck) {
       await ensureStillRunning(this);
@@ -44,10 +63,10 @@ export class Service {
         stdio: "ignore",
         terminationGracePeriod: Math.min(1_000, remaining),
       });
-      const outcome = await Promise.race([
-        check.exited.then((result) => ({ type: "check", result })),
-        this.exited.then((result) => ({ type: "service", result })),
-        sleep(remaining).then(() => ({ type: "timeout" })),
+      const outcome: HealthcheckOutcome = await Promise.race([
+        check.exited.then((result) => ({ type: "check" as const, result })),
+        this.exited.then((result) => ({ type: "service" as const, result })),
+        sleep(remaining).then(() => ({ type: "timeout" as const })),
       ]);
 
       if (outcome.type === "service") {
@@ -69,25 +88,22 @@ export class Service {
     );
   }
 
-  terminate() {
+  terminate(): Promise<ProcessResult> {
     return this.#process.terminate();
   }
 
-  async [Symbol.asyncDispose]() {
+  async [Symbol.asyncDispose](): Promise<void> {
     await this.terminate();
   }
 }
 
-async function ensureStillRunning(service) {
+async function ensureStillRunning(service: Service): Promise<void> {
   const marker = Symbol("running");
-  const outcome = await Promise.race([
-    service.exited,
-    Promise.resolve(marker),
-  ]);
+  const outcome = await Promise.race([service.exited, Promise.resolve(marker)]);
   if (outcome !== marker) throw exitedDuringStartup(service.key, outcome);
 }
 
-function exitedDuringStartup(service, result) {
+function exitedDuringStartup(service: string, result: ProcessResult): ServiceStartupError {
   if (result.error) {
     return new ServiceStartupError(service, result.error.message, { cause: result.error });
   }

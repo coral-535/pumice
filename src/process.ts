@@ -1,11 +1,30 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
 
-export class ManagedProcess {
-  #child;
+export interface ProcessResult {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  error: Error | null;
+}
+
+export interface ManagedProcessOptions {
+  cwd?: string;
+  env?: Record<string, string | undefined>;
+  stdio?: StdioOptions;
+  terminationGracePeriod?: number;
+}
+
+export class ManagedProcess implements AsyncDisposable {
+  readonly command: string;
+  readonly terminationGracePeriod: number;
+  readonly pid: number | undefined;
+  readonly spawned: Promise<void>;
+  readonly exited: Promise<ProcessResult>;
+
+  #child: ChildProcess;
   #finished = false;
-  #termination;
+  #termination: Promise<ProcessResult> | undefined;
 
-  constructor(command, options = {}) {
+  constructor(command: string, options: ManagedProcessOptions = {}) {
     this.command = command;
     this.terminationGracePeriod = options.terminationGracePeriod ?? 5_000;
     const env = { ...process.env };
@@ -21,14 +40,14 @@ export class ManagedProcess {
       detached: process.platform !== "win32",
     });
     this.pid = this.#child.pid;
-    this.spawned = new Promise((resolve, reject) => {
+    this.spawned = new Promise<void>((resolve, reject) => {
       this.#child.once("spawn", resolve);
       this.#child.once("error", reject);
     });
-    this.spawned.catch(() => {});
-    this.exited = new Promise((resolve) => {
+    void this.spawned.catch(() => {});
+    this.exited = new Promise<ProcessResult>((resolve) => {
       let settled = false;
-      const finish = (result) => {
+      const finish = (result: ProcessResult) => {
         if (settled) return;
         settled = true;
         this.#finished = true;
@@ -39,17 +58,16 @@ export class ManagedProcess {
     });
   }
 
-  get finished() {
+  get finished(): boolean {
     return this.#finished;
   }
 
-  terminate() {
-    if (this.#termination) return this.#termination;
-    this.#termination = this.#terminate();
+  terminate(): Promise<ProcessResult> {
+    this.#termination ??= this.#terminate();
     return this.#termination;
   }
 
-  async #terminate() {
+  async #terminate(): Promise<ProcessResult> {
     if (this.pid === undefined) return this.exited;
     if (this.#finished && !this.#groupIsAlive()) return this.exited;
 
@@ -58,56 +76,54 @@ export class ManagedProcess {
     if (graceful) return this.exited;
 
     this.#signal("SIGKILL");
-    await Promise.all([
-      this.exited,
-      waitForProcessGroup(this, 1_000),
-    ]);
+    await Promise.all([this.exited, waitForProcessGroup(this, 1_000)]);
     return this.exited;
   }
 
-  #signal(signal) {
+  #signal(signal: NodeJS.Signals): void {
     if (this.pid === undefined) return;
     try {
-      if (process.platform === "win32") {
-        this.#child.kill(signal);
-      } else {
-        process.kill(-this.pid, signal);
-      }
+      if (process.platform === "win32") this.#child.kill(signal);
+      else process.kill(-this.pid, signal);
     } catch (error) {
-      if (error?.code !== "ESRCH") throw error;
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
     }
   }
 
-  #groupIsAlive() {
+  #groupIsAlive(): boolean {
     if (this.pid === undefined) return false;
     if (process.platform === "win32") return !this.#finished;
     try {
       process.kill(-this.pid, 0);
       return true;
     } catch (error) {
-      if (error?.code === "ESRCH") return false;
-      if (error?.code === "EPERM") return true;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ESRCH") return false;
+      if (code === "EPERM") return true;
       throw error;
     }
   }
 
-  groupIsAlive() {
+  groupIsAlive(): boolean {
     return this.#groupIsAlive();
   }
 
-  [Symbol.asyncDispose]() {
-    return this.terminate();
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.terminate();
   }
 }
 
-export function sleep(milliseconds) {
+export function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => {
     const timer = setTimeout(resolve, milliseconds);
     timer.unref?.();
   });
 }
 
-async function waitForProcessGroup(managedProcess, milliseconds) {
+async function waitForProcessGroup(
+  managedProcess: ManagedProcess,
+  milliseconds: number,
+): Promise<boolean> {
   const deadline = Date.now() + milliseconds;
   while (managedProcess.groupIsAlive()) {
     if (Date.now() >= deadline) return false;
