@@ -34,7 +34,7 @@ jobs:
       - name: Set version
         run: |
           version="${GITHUB_REF_NAME#v}"
-          vp pm version "$version" --no-git-tag-version --allow-same-version
+          vp pm version "$version" -- --no-git-tag-version --allow-same-version
 
           if [[ "$version" == *-* ]]; then
             prerelease="${version#*-}"
