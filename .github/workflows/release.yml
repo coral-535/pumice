@@ -22,12 +22,6 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v6
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-
       - name: Set up Node
         uses: actions/setup-node@v6
         with:
@@ -54,27 +48,7 @@ jobs:
           echo "IS_PRERELEASE=$is_prerelease" >> "$GITHUB_ENV"
 
       - name: Test
-        run: |
-          go test -race ./...
-          go vet ./...
-
-      - name: Build
-        run: |
-          mkdir -p bin
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
-            goos="${target%/*}"
-            goarch="${target#*/}"
-            if [[ "$goarch" == "amd64" ]]; then
-              npm_arch=x64
-            else
-              npm_arch=arm64
-            fi
-
-            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
-              go build -trimpath -ldflags="-s -w -X main.version=$VERSION" \
-              -o "bin/pum-${goos}-${npm_arch}" .
-          done
-          chmod +x bin/pum-*
+        run: npm test
 
       - name: Publish package
         run: npm publish --tag "$NPM_TAG"
@@ -83,7 +57,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          args=("$GITHUB_REF_NAME" bin/pum-* --verify-tag --generate-notes)
+          args=("$GITHUB_REF_NAME" --verify-tag --generate-notes)
           if [[ "$IS_PRERELEASE" == "true" ]]; then
             args+=(--prerelease)
           fi
