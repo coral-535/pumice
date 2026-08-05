@@ -5,7 +5,11 @@ export default defineConfig({
     "*": "vp check --fix",
   },
   pack: {
-    entry: ["src/index.ts", "src/core.ts", "src/daemon-cli.ts"],
+    entry: {
+      index: "src/index.ts",
+      core: "src/core/index.ts",
+      "daemon-cli": "src/daemon-cli.ts",
+    },
     dts: {
       tsgo: true,
     },

@@ -2,8 +2,8 @@
 
 import { mkdir, rm } from "node:fs/promises";
 import { dirname } from "node:path";
-import { DaemonServer } from "./daemon.ts";
-import { acquireDaemonLock } from "./runtime.ts";
+import { DaemonServer } from "./core/daemon.ts";
+import { acquireDaemonLock } from "./core/runtime.ts";
 
 const options = parseArguments(process.argv.slice(2));
 await mkdir(dirname(options.lockPath), { recursive: true, mode: 0o700 });

@@ -10,7 +10,7 @@ import { resolveRuntime, type RuntimePaths } from "./runtime.ts";
 
 const DAEMON_ENTRY = fileURLToPath(
   new URL(
-    import.meta.url.endsWith(".ts") ? "./daemon-cli.ts" : "./daemon-cli.mjs",
+    import.meta.url.endsWith(".ts") ? "../daemon-cli.ts" : "./daemon-cli.mjs",
     import.meta.url,
   ),
 );
