@@ -16,7 +16,7 @@ import {
   type DaemonEvent,
   type ServiceDefinition,
   type ServiceGuardOptions,
-} from "../src/index.ts";
+} from "../src/core.ts";
 import { resolveRuntime } from "../src/runtime.ts";
 
 const FIXTURES = fileURLToPath(new URL("fixtures/", import.meta.url));

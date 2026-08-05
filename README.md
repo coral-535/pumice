@@ -8,7 +8,7 @@ that connection releases them atomically.
 Both resources surrounding a run are async-disposable:
 
 ```js
-import { ServiceGuard, startCommand } from "pumice-cli";
+import { ServiceGuard, startCommand } from "pumice-cli/core";
 
 await using guard = await ServiceGuard.connect(process.cwd());
 await guard.run({
@@ -35,7 +35,7 @@ the command, terminates the command's process group if a required service dies,
 waits for that group to exit, and finally releases the guard.
 
 ```js
-import { run } from "pumice-cli";
+import { run } from "pumice-cli/core";
 
 const result = await run(
   process.cwd(),
