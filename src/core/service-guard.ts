@@ -15,6 +15,14 @@ const DAEMON_ENTRY = fileURLToPath(
   ),
 );
 
+export const TASK_SCOPED_ENVIRONMENT_VARIABLES = [
+  "VP_RUN_IPC_NAME",
+  "VP_RUN_NODE_CLIENT_PATH",
+  "FSPY_PAYLOAD",
+  "LD_PRELOAD",
+  "DYLD_INSERT_LIBRARIES",
+] as const;
+
 export type DaemonEvent =
   | {
       type: "service-exited";
@@ -69,6 +77,13 @@ export class ServiceGuard implements AsyncDisposable {
       : await resolveRuntime(worktreePath);
     const socket = await connectOrStart(runtime, options);
     return new ServiceGuard(new JsonLineChannel(socket));
+  }
+
+  static create(
+    worktreePath = process.cwd(),
+    options: ServiceGuardOptions = {},
+  ): Promise<ServiceGuard> {
+    return ServiceGuard.connect(worktreePath, options);
   }
 
   run(plan: Plan | ServiceDefinition[]): Promise<AcquiredPlan> {
@@ -217,9 +232,20 @@ function launchDaemon(runtime: DaemonRuntime, options: ServiceGuardOptions): voi
       "--lock",
       runtime.lockPath,
     ],
-    { cwd: runtime.worktree, detached: true, stdio: "ignore" },
+    {
+      cwd: runtime.worktree,
+      detached: true,
+      stdio: "ignore",
+      env: daemonEnvironment(process.env),
+    },
   );
   child.unref();
+}
+
+export function daemonEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const environment = { ...source };
+  for (const name of TASK_SCOPED_ENVIRONMENT_VARIABLES) delete environment[name];
+  return environment;
 }
 
 function delay(milliseconds: number): Promise<void> {

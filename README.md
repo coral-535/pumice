@@ -49,6 +49,58 @@ active name with a different definition fails. Unexpected service exits and
 daemon disconnects are terminal for every affected guard. There is no automatic
 restart policy.
 
+## Vite Task integration
+
+`definePumice()` compiles a service chain and finite command into an immutable,
+content-addressed manifest. The returned task runs the Node wrapper shipped in
+this package, so there is no separate Pumice task executable to install:
+
+```ts
+import { definePumice } from "pumice-cli";
+
+const pumice = definePumice({
+  ports: ["DATABASE_PORT"],
+  services: {
+    db: {
+      command: "pglite-server --port $DATABASE_PORT",
+      healthcheck: "pg_isready --port $DATABASE_PORT",
+    },
+  },
+});
+
+const db = pumice.service("db");
+
+export default defineConfig({
+  run: {
+    tasks: {
+      migrate: db.task({ command: "pnpm drizzle-kit migrate" }),
+    },
+  },
+});
+```
+
+Nested handles compose dependencies. In this example, `api.task()` starts and
+health-checks `db`, then `api`, before it starts the finite command:
+
+```ts
+const api = db.service({
+  name: "api",
+  command: "node apps/api/server.mjs --port $API_PORT",
+  healthcheck: "curl -f http://127.0.0.1:$API_PORT/health",
+  ports: ["API_PORT"],
+});
+```
+
+Generated manifests live under
+`node_modules/.cache/pumice/manifests/<sha256>.json`. Equivalent plans reuse the
+same file, while any plan change produces a new path. The generated Vite Task
+definition defaults to `cache: false`; extra arguments passed by Vite Task are
+forwarded to the real command as distinct argv values.
+
+Each wrapper owns one service lease. Strictly sequential Vite Task nodes can
+therefore stop and restart a service between nodes when no other wrapper holds
+a reference. A run-level lease spanning multiple task nodes is outside v1.
+
 Pumice currently uses POSIX process groups for descendant cleanup. On Windows,
 termination is limited to the direct child until Job Object containment is
 implemented.
