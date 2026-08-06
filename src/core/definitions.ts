@@ -6,6 +6,8 @@ export interface ServiceDefinition {
   command: string;
   healthcheck?: string;
   healthcheckTimeout?: number;
+  healthcheckInterval?: number;
+  dependsOn?: string[];
   cwd?: string;
   env?: Record<string, string | undefined>;
 }
@@ -19,6 +21,8 @@ export interface NormalizedServiceDefinition {
   command: string;
   healthcheck: string | undefined;
   healthcheckTimeout: number;
+  healthcheckInterval: number;
+  dependsOn: string[];
   cwd: string;
   env: Record<string, string | undefined>;
 }
@@ -48,17 +52,38 @@ export function normalizePlan(plan: unknown): NormalizedPlan {
   if (!Array.isArray(services)) {
     throw new TypeError("plan.services must be an array");
   }
-  const seen = new Set<string>();
-  return {
-    services: services.map((definition: unknown) => {
-      const normalized = normalizeServiceDefinition(definition);
-      if (seen.has(normalized.name)) {
-        throw new TypeError(`service ${JSON.stringify(normalized.name)} occurs more than once`);
+  const normalized = services.map((definition: unknown) => normalizeServiceDefinition(definition));
+  const byName = new Map<string, NormalizedServiceDefinition>();
+  for (const definition of normalized) {
+    if (byName.has(definition.name)) {
+      throw new TypeError(`service ${JSON.stringify(definition.name)} occurs more than once`);
+    }
+    byName.set(definition.name, definition);
+  }
+  const ordered: NormalizedServiceDefinition[] = [];
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (definition: NormalizedServiceDefinition) => {
+    if (visited.has(definition.name)) return;
+    if (visiting.has(definition.name)) {
+      throw new TypeError(`service dependency graph contains a cycle at ${definition.name}`);
+    }
+    visiting.add(definition.name);
+    for (const name of definition.dependsOn) {
+      const dependency = byName.get(name);
+      if (!dependency) {
+        throw new TypeError(
+          `service ${JSON.stringify(definition.name)} depends on unknown service ${JSON.stringify(name)}`,
+        );
       }
-      seen.add(normalized.name);
-      return normalized;
-    }),
+      visit(dependency);
+    }
+    visiting.delete(definition.name);
+    visited.add(definition.name);
+    ordered.push(definition);
   };
+  for (const definition of normalized) visit(definition);
+  return { services: ordered };
 }
 
 export function normalizeServiceDefinition(definition: unknown): NormalizedServiceDefinition {
@@ -74,9 +99,27 @@ export function normalizeServiceDefinition(definition: unknown): NormalizedServi
   ) {
     throw new TypeError("healthcheckTimeout must be a positive integer in milliseconds");
   }
+  const healthcheckInterval = value.healthcheckInterval ?? 100;
+  if (
+    typeof healthcheckInterval !== "number" ||
+    !Number.isSafeInteger(healthcheckInterval) ||
+    healthcheckInterval <= 0
+  ) {
+    throw new TypeError("healthcheckInterval must be a positive integer in milliseconds");
+  }
+  const dependsOn = normalizeStringArray(value.dependsOn, "dependsOn");
   const cwd = value.cwd === undefined ? process.cwd() : requiredString(value.cwd, "cwd");
   const env = normalizeEnvironment(value.env);
-  return { name, command, healthcheck, healthcheckTimeout, cwd, env };
+  return {
+    name,
+    command,
+    healthcheck,
+    healthcheckTimeout,
+    healthcheckInterval,
+    dependsOn,
+    cwd,
+    env,
+  };
 }
 
 export function normalizeCommandDefinition(
@@ -102,11 +145,23 @@ export function definitionFingerprint(definition: NormalizedServiceDefinition): 
         command: definition.command,
         healthcheck: definition.healthcheck,
         healthcheckTimeout: definition.healthcheckTimeout,
+        healthcheckInterval: definition.healthcheckInterval,
+        dependsOn: [...definition.dependsOn].sort(),
         cwd: definition.cwd,
         env: Object.entries(definition.env).sort(([a], [b]) => a.localeCompare(b)),
       }),
     )
     .digest("hex");
+}
+
+function normalizeStringArray(value: unknown, label: string): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new TypeError(`${label} must be an array`);
+  const result = value.map((item) => requiredString(item, `${label} entry`));
+  if (new Set(result).size !== result.length) {
+    throw new TypeError(`${label} must not contain duplicates`);
+  }
+  return result;
 }
 
 function normalizeEnvironment(value: unknown): Record<string, string | undefined> {

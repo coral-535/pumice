@@ -9,6 +9,7 @@ export interface ProcessResult {
 export interface ManagedProcessOptions {
   cwd?: string;
   env?: Record<string, string | undefined>;
+  additionalArgs?: readonly string[];
   stdio?: StdioOptions;
   terminationGracePeriod?: number;
 }
@@ -32,8 +33,9 @@ export class ManagedProcess implements AsyncDisposable {
       if (value === undefined) delete env[key];
       else env[key] = value;
     }
-    this.#child = spawn(command, {
-      shell: true,
+    const invocation = shellInvocation(command, options.additionalArgs ?? []);
+    this.#child = spawn(invocation.file, invocation.arguments, {
+      shell: invocation.shell,
       cwd: options.cwd,
       env,
       stdio: options.stdio ?? "inherit",
@@ -62,16 +64,16 @@ export class ManagedProcess implements AsyncDisposable {
     return this.#finished;
   }
 
-  terminate(): Promise<ProcessResult> {
-    this.#termination ??= this.#terminate();
+  terminate(signal: NodeJS.Signals = "SIGTERM"): Promise<ProcessResult> {
+    this.#termination ??= this.#terminate(signal);
     return this.#termination;
   }
 
-  async #terminate(): Promise<ProcessResult> {
+  async #terminate(signal: NodeJS.Signals): Promise<ProcessResult> {
     if (this.pid === undefined) return this.exited;
     if (this.#finished && !this.#groupIsAlive()) return this.exited;
 
-    this.#signal("SIGTERM");
+    this.#signal(signal);
     const graceful = await waitForProcessGroup(this, this.terminationGracePeriod);
     if (graceful) return this.exited;
 
@@ -111,6 +113,21 @@ export class ManagedProcess implements AsyncDisposable {
   async [Symbol.asyncDispose](): Promise<void> {
     await this.terminate();
   }
+}
+
+function shellInvocation(
+  command: string,
+  additionalArgs: readonly string[],
+): { file: string; arguments: string[]; shell: boolean } {
+  if (additionalArgs.length === 0) return { file: command, arguments: [], shell: true };
+  if (process.platform === "win32") {
+    return { file: command, arguments: [...additionalArgs], shell: true };
+  }
+  return {
+    file: process.env.SHELL || "/bin/sh",
+    arguments: ["-c", `${command} "$@"`, "pumice-command", ...additionalArgs],
+    shell: false,
+  };
 }
 
 export function sleep(milliseconds: number): Promise<void> {

@@ -6,8 +6,6 @@ import {
 import { ServiceStartupError } from "./errors.ts";
 import { ManagedProcess, sleep, type ProcessResult } from "./process.ts";
 
-const HEALTHCHECK_INTERVAL = 100;
-
 type HealthcheckOutcome =
   | { type: "check"; result: ProcessResult }
   | { type: "service"; result: ProcessResult }
@@ -79,7 +77,9 @@ export class Service implements AsyncDisposable {
       }
       if (outcome.result.code === 0 && !outcome.result.error) return;
 
-      await sleep(Math.min(HEALTHCHECK_INTERVAL, Math.max(0, deadline - Date.now())));
+      await sleep(
+        Math.min(this.definition.healthcheckInterval, Math.max(0, deadline - Date.now())),
+      );
     }
 
     throw new ServiceStartupError(

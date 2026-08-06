@@ -9,6 +9,7 @@ export default defineConfig({
       index: "src/index.ts",
       core: "src/core/index.ts",
       "daemon-cli": "src/daemon-cli.ts",
+      "vite-task-runner": "src/vite-task-runner.ts",
     },
     dts: {
       tsgo: true,

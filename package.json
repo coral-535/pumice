@@ -11,9 +11,6 @@
     "type": "git",
     "url": "git+https://github.com/coral-535/pumice.git"
   },
-  "bin": {
-    "pumice-daemon": "./dist/daemon-cli.mjs"
-  },
   "files": [
     "dist",
     "README.md",
@@ -29,6 +26,10 @@
     "./core": {
       "types": "./dist/core.d.mts",
       "import": "./dist/core.mjs"
+    },
+    "./vite-task-runner": {
+      "types": "./dist/vite-task-runner.d.mts",
+      "import": "./dist/vite-task-runner.mjs"
     },
     "./package.json": "./package.json"
   },
