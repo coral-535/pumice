@@ -92,6 +92,20 @@ test("nested service composition produces a topologically ordered v1 manifest", 
   assert.equal(task.cache, false);
   assert.equal(task.persistent, true);
   assert.match(task.command, /^node '.+vite-task-runner\.ts' '.+\/[a-f0-9]{64}\.json'$/);
+
+  const services = pumice.viteServices;
+  assert.deepEqual(Object.keys(services), ["db", "api"]);
+  assert.equal(services.db?.cache, false);
+  assert.equal(services.api?.cache, false);
+  assert.match(
+    services.db?.command ?? "",
+    /^node '.+vite-task-runner\.ts' '.+\/[a-f0-9]{64}\.json'$/,
+  );
+  assert.equal(readTaskManifest(services.db!.command).command, null);
+  assert.deepEqual(
+    readTaskManifest(services.api!.command).services.map(({ name }) => name),
+    ["db", "api"],
+  );
 });
 
 test("manifests are immutable, reusable, and validated against their filename", async () => {
@@ -193,6 +207,12 @@ async function temporaryDirectory() {
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function readTaskManifest(command: string) {
+  const match = command.match(/'([^']+\.json)'$/);
+  assert.ok(match?.[1], `could not find manifest path in ${command}`);
+  return readAndValidateManifest(match[1]);
 }
 
 async function waitForFile(path: string, timeout = 2_000): Promise<void> {

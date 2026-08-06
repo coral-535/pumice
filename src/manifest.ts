@@ -38,6 +38,16 @@ export interface CompiledManifest {
   command: CompiledCommand;
 }
 
+export interface CompiledServiceManifest {
+  version: typeof MANIFEST_VERSION;
+  workspaceRoot: string;
+  scope: ManifestScope;
+  services: CompiledService[];
+  command: null;
+}
+
+export type PumiceManifest = CompiledManifest | CompiledServiceManifest;
+
 export function stableStringify(value: unknown): string {
   const ancestors = new Set<object>();
   const serialize = (input: unknown): string => {
@@ -70,13 +80,13 @@ export function stableStringify(value: unknown): string {
   return serialize(value);
 }
 
-export function manifestHash(manifestOrJson: CompiledManifest | string): string {
+export function manifestHash(manifestOrJson: PumiceManifest | string): string {
   const json =
     typeof manifestOrJson === "string" ? manifestOrJson : stableStringify(manifestOrJson);
   return createHash("sha256").update(json).digest("hex");
 }
 
-export function writeManifest(cacheDirectory: string, manifest: CompiledManifest): string {
+export function writeManifest(cacheDirectory: string, manifest: PumiceManifest): string {
   validateManifest(manifest);
   const json = stableStringify(manifest);
   const path = join(resolve(cacheDirectory), "manifests", `${manifestHash(json)}.json`);
@@ -92,7 +102,7 @@ export function writeManifest(cacheDirectory: string, manifest: CompiledManifest
   return path;
 }
 
-export function readAndValidateManifest(path: string): CompiledManifest {
+export function readAndValidateManifest(path: string): PumiceManifest {
   if (!isAbsolute(path)) throw new TypeError("Pumice manifest path must be absolute");
   const json = readFileSync(path, "utf8");
   const expectedName = `${manifestHash(json)}.json`;
@@ -112,7 +122,7 @@ export function readAndValidateManifest(path: string): CompiledManifest {
   return validateManifest(input);
 }
 
-export function validateManifest(input: unknown): CompiledManifest {
+export function validateManifest(input: unknown): PumiceManifest {
   const manifest = record(input, "manifest");
   if (manifest.version !== MANIFEST_VERSION) {
     throw new TypeError(`unsupported Pumice manifest version ${JSON.stringify(manifest.version)}`);
@@ -134,12 +144,15 @@ export function validateManifest(input: unknown): CompiledManifest {
     validateService(service, `manifest.services[${index}]`),
   );
   validateServiceGraph(services);
-  const commandInput = record(manifest.command, "manifest.command");
-  const command: CompiledCommand = {
-    command: requiredString(commandInput.command, "manifest.command.command"),
-    cwd: absolutePath(commandInput.cwd, "manifest.command.cwd"),
-    env: stringEnvironment(commandInput.env, "manifest.command.env"),
-  };
+  let command: CompiledCommand | null = null;
+  if (manifest.command !== null) {
+    const commandInput = record(manifest.command, "manifest.command");
+    command = {
+      command: requiredString(commandInput.command, "manifest.command.command"),
+      cwd: absolutePath(commandInput.cwd, "manifest.command.cwd"),
+      env: stringEnvironment(commandInput.env, "manifest.command.env"),
+    };
+  }
   return { version: MANIFEST_VERSION, workspaceRoot, scope, services, command };
 }
 

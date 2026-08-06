@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 import { constants } from "node:os";
 import { startCommand, type RunningCommand } from "./core/command.ts";
 import { ServiceGuard } from "./core/service-guard.ts";
-import { readAndValidateManifest, type CompiledManifest } from "./manifest.ts";
+import { readAndValidateManifest, type PumiceManifest } from "./manifest.ts";
 
 export async function main(arguments_ = process.argv.slice(2)): Promise<number> {
   const [manifestPath, ...additionalArgs] = arguments_;
@@ -13,6 +13,7 @@ export async function main(arguments_ = process.argv.slice(2)): Promise<number> 
 
   await using guard = await ServiceGuard.connect(manifest.workspaceRoot);
   await guard.run(toDaemonPlan(manifest));
+  if (manifest.command === null) return await holdServiceLease(guard);
   await using command = startCommand({ ...manifest.command, stdio: "inherit" }, { additionalArgs });
   using _signals = installSignalForwarding(command);
   const outcome = await Promise.race([
@@ -25,6 +26,28 @@ export async function main(arguments_ = process.argv.slice(2)): Promise<number> 
   }
   if (outcome.result.error) throw outcome.result.error;
   return toExitCode(outcome.result.code, outcome.result.signal);
+}
+
+async function holdServiceLease(guard: ServiceGuard): Promise<number> {
+  let resolveSignal!: (signal: NodeJS.Signals) => void;
+  const signal = new Promise<NodeJS.Signals>((resolve) => {
+    resolveSignal = resolve;
+  });
+  const onSigint = () => resolveSignal("SIGINT");
+  const onSigterm = () => resolveSignal("SIGTERM");
+  process.once("SIGINT", onSigint);
+  process.once("SIGTERM", onSigterm);
+  try {
+    const outcome = await Promise.race([
+      signal.then((value) => ({ type: "signal" as const, value })),
+      guard.failure.then((error) => ({ type: "guard" as const, error })),
+    ]);
+    if (outcome.type === "guard") throw outcome.error;
+    return 128 + constants.signals[outcome.value];
+  } finally {
+    process.off("SIGINT", onSigint);
+    process.off("SIGTERM", onSigterm);
+  }
 }
 
 function toExitCode(code: number | null, signal: NodeJS.Signals | null): number {
@@ -46,7 +69,7 @@ export function installSignalForwarding(command: RunningCommand): Disposable {
   };
 }
 
-function toDaemonPlan(manifest: CompiledManifest) {
+function toDaemonPlan(manifest: PumiceManifest) {
   return {
     services: manifest.services.map((service) => ({
       name: service.name,

@@ -74,10 +74,16 @@ export default defineConfig({
   run: {
     tasks: {
       migrate: db.task({ command: "pnpm drizzle-kit migrate" }),
+      ...pumice.viteServices,
     },
   },
 });
 ```
+
+`pumice.viteServices` adds one non-cached Vite task for each registered service.
+Running `vp run db`, for example, starts `db` and its dependencies, waits until
+they are healthy, and holds their leases until the task is stopped. The map is
+resolved when it is read, so services added through nested handles are included.
 
 Nested handles compose dependencies. In this example, `api.task()` starts and
 health-checks `db`, then `api`, before it starts the finite command:

@@ -8,6 +8,7 @@ import {
   canonicalWorkspaceRoot,
   type CompiledCommand,
   type CompiledManifest,
+  type CompiledServiceManifest,
   type CompiledService,
   type ManifestScope,
   writeManifest,
@@ -70,6 +71,7 @@ export interface PumiceServiceHandle {
 }
 
 export interface Pumice {
+  readonly viteServices: Readonly<Record<string, ViteTaskDefinition>>;
   service(name: string): PumiceServiceHandle;
 }
 
@@ -98,12 +100,35 @@ export function definePumice(configuration: PumiceConfiguration = {}): Pumice {
     registerService(internal, name, service);
   }
   return {
+    get viteServices() {
+      return Object.freeze(
+        Object.fromEntries(
+          [...internal.services.keys()].map((name) => [
+            name,
+            createViteServiceTask(internal, name),
+          ]),
+        ),
+      );
+    },
     service(name) {
       if (!internal.services.has(name)) {
         throw new TypeError(`unknown Pumice service ${JSON.stringify(name)}`);
       }
       return createServiceHandle(internal, name, []);
     },
+  };
+}
+
+function createViteServiceTask(
+  configuration: InternalConfiguration,
+  name: string,
+): ViteTaskDefinition {
+  const manifest = compileServiceFromHandle(configuration, [name]);
+  const manifestPath = writeManifest(configuration.cacheDirectory, manifest);
+  const runnerPath = resolve(resolveViteTaskRunner());
+  return {
+    command: `node ${shellQuote(runnerPath)} ${shellQuote(manifestPath)}`,
+    cache: false,
   };
 }
 
@@ -169,6 +194,44 @@ function compileFromHandle(
   commandInput: string | PumiceCommandDefinition,
   options: CompileTaskOptions,
 ): CompiledManifest {
+  const plan = compileServicePlan(configuration, chain, options);
+  const commandDefinition = normalizeCommandInput(commandInput);
+  const commandEnvironment = {
+    ...plan.baseEnvironment,
+    ...Object.fromEntries(
+      plan.requiredNames.flatMap((name) =>
+        Object.entries(plan.serviceEnvironments.get(name) ?? {}),
+      ),
+    ),
+    ...concreteEnvironment(commandDefinition.env as Record<string, string | undefined> | undefined),
+  };
+  const command: CompiledCommand = {
+    command: interpolate(commandDefinition.command, commandEnvironment),
+    cwd: resolveWorkspacePath(plan.workspaceRoot, commandDefinition.cwd as string | undefined),
+    env: commandEnvironment,
+  };
+  return {
+    version: MANIFEST_VERSION,
+    workspaceRoot: plan.workspaceRoot,
+    scope: configuration.scope,
+    services: plan.services,
+    command,
+  };
+}
+
+interface CompiledServicePlan {
+  workspaceRoot: string;
+  requiredNames: string[];
+  baseEnvironment: Record<string, string>;
+  serviceEnvironments: Map<string, Record<string, string>>;
+  services: CompiledService[];
+}
+
+function compileServicePlan(
+  configuration: InternalConfiguration,
+  chain: string[],
+  options: CompileTaskOptions,
+): CompiledServicePlan {
   const workspaceRoot = options.workspaceRoot
     ? canonicalWorkspaceRoot(options.workspaceRoot)
     : configuration.workspaceRoot;
@@ -215,25 +278,21 @@ function compileFromHandle(
       ),
     };
   });
-  const commandDefinition = normalizeCommandInput(commandInput);
-  const commandEnvironment = {
-    ...baseEnvironment,
-    ...Object.fromEntries(
-      requiredNames.flatMap((name) => Object.entries(serviceEnvironments.get(name) ?? {})),
-    ),
-    ...concreteEnvironment(commandDefinition.env as Record<string, string | undefined> | undefined),
-  };
-  const command: CompiledCommand = {
-    command: interpolate(commandDefinition.command, commandEnvironment),
-    cwd: resolveWorkspacePath(workspaceRoot, commandDefinition.cwd as string | undefined),
-    env: commandEnvironment,
-  };
+  return { workspaceRoot, requiredNames, baseEnvironment, serviceEnvironments, services };
+}
+
+function compileServiceFromHandle(
+  configuration: InternalConfiguration,
+  chain: string[],
+  options: CompileTaskOptions = {},
+): CompiledServiceManifest {
+  const plan = compileServicePlan(configuration, chain, options);
   return {
     version: MANIFEST_VERSION,
-    workspaceRoot,
+    workspaceRoot: plan.workspaceRoot,
     scope: configuration.scope,
-    services,
-    command,
+    services: plan.services,
+    command: null,
   };
 }
 
