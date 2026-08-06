@@ -1,6 +1,6 @@
 {
   "name": "pumice-cli",
-  "version": "0.1.0-alpha.0",
+  "version": "0.0.7",
   "description": "Worktree-scoped service guards for finite commands",
   "homepage": "https://github.com/coral-535/pumice#readme",
   "bugs": {

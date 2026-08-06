@@ -131,18 +131,17 @@ to staged files using `vite.config.ts`.
 
 ## Publishing
 
-Update the version with `vp run bump`, then choose one of the Vite+ publishing
-flows:
+Pumice uses stable releases. Do not create a prerelease version or tag unless a
+prerelease is explicitly requested.
+
+Update the version in `package.json`, commit it, then create and push the
+matching `v<version>` tag:
 
 ```sh
-# Build and publish directly through the detected package manager
-vp run release
-
-# Upload a CI-friendly staged release, then approve it from a trusted device
-vp run release:stage
-vp pm stage list
-vp pm stage approve <stage-id>
+git tag -s v0.0.7 -m "Release 0.0.7"
+git push origin v0.0.7
 ```
 
-Both release scripts run checks, tests, and `vp pack` first. Publishing also
-invokes `prepublishOnly`, ensuring `dist/` is rebuilt from the tagged source.
+The Release workflow checks, tests, and packs the tagged source, then waits for
+approval from the GitHub `npm` environment before publishing with provenance
+and creating the GitHub release.
