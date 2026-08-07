@@ -39,6 +39,7 @@ export interface ServiceGuardOptions {
   connectTimeout?: number;
   startDaemon?: boolean;
   daemonEntry?: string;
+  output?: (message: string) => void;
 }
 
 type DaemonFailure = DaemonDisconnectedError | ServiceExitedError;
@@ -56,9 +57,11 @@ export class ServiceGuard implements AsyncDisposable {
   #disposing = false;
   #disposed = false;
   #disposePromise: Promise<void> | undefined;
+  #output: (message: string) => void;
 
-  constructor(channel: JsonLineChannel) {
+  constructor(channel: JsonLineChannel, output = defaultOutput) {
     this.#channel = channel;
+    this.#output = output;
     this.failure = this.#failure.promise;
     channel.onMessage((message) => this.#receive(message));
     channel.onClose(() => this.#disconnected());
@@ -76,7 +79,7 @@ export class ServiceGuard implements AsyncDisposable {
         }
       : await resolveRuntime(worktreePath);
     const socket = await connectOrStart(runtime, options);
-    return new ServiceGuard(new JsonLineChannel(socket));
+    return new ServiceGuard(new JsonLineChannel(socket), options.output);
   }
 
   static create(
@@ -137,6 +140,18 @@ export class ServiceGuard implements AsyncDisposable {
 
   #receive(input: unknown): void {
     const message = asRecord(input);
+    if (
+      message.type === "service-acquisition" &&
+      typeof message.service === "string" &&
+      (message.action === "started" || message.action === "reused")
+    ) {
+      this.#output(
+        message.action === "started"
+          ? `Starting ${message.service}...`
+          : `Using existing ${message.service} service.`,
+      );
+      return;
+    }
     if (message.type === "response" && typeof message.id === "number") {
       const pending = this.#pending.get(message.id);
       if (!pending) return;
@@ -179,6 +194,10 @@ export class ServiceGuard implements AsyncDisposable {
     this.#failureSettled = true;
     this.#failure.resolve(error);
   }
+}
+
+function defaultOutput(message: string): void {
+  console.error(message);
 }
 
 async function connectOrStart(

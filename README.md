@@ -47,7 +47,9 @@ const result = await run(
 Services with the same name and definition share one generation. Acquiring an
 active name with a different definition fails. Unexpected service exits and
 daemon disconnects are terminal for every affected guard. There is no automatic
-restart policy.
+restart policy. Core clients report `Starting db...` for a new service and
+`Using existing db service.` when they reuse an active one. Pass an `output`
+callback to `ServiceGuard.connect()` to redirect these lifecycle messages.
 
 ## Vite Task integration
 
@@ -102,6 +104,9 @@ Generated manifests live under
 same file, while any plan change produces a new path. The generated Vite Task
 definition defaults to `cache: false`; extra arguments passed by Vite Task are
 forwarded to the real command as distinct argv values.
+
+The Vite Task runner prints the same start and reuse messages for every service
+in the task's service chain.
 
 Each wrapper owns one service lease. Strictly sequential Vite Task nodes can
 therefore stop and restart a service between nodes when no other wrapper holds

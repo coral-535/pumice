@@ -18,7 +18,11 @@ export interface DaemonServerOptions {
 }
 
 export interface AcquiredPlan {
-  services: Array<{ name: string; generation: number }>;
+  services: Array<{
+    name: string;
+    generation: number;
+    action: "started" | "reused";
+  }>;
 }
 
 interface DaemonConnection {
@@ -40,7 +44,7 @@ interface ServiceRecord {
 interface AcquireResult {
   added: boolean;
   record: ServiceRecord;
-  publicRecord: { name: string; generation: number };
+  publicRecord: AcquiredPlan["services"][number];
 }
 
 export class DaemonServer {
@@ -182,6 +186,7 @@ export class DaemonServer {
       throw new ServiceConfigurationError(definition.name);
     }
 
+    const action = record ? "reused" : "started";
     if (!record) {
       record = this.#startRecord(definition, fingerprint);
       this.#services.set(definition.name, record);
@@ -192,6 +197,12 @@ export class DaemonServer {
       connection.references.set(definition.name, record);
       record.connections.add(connection);
     }
+    connection.channel.send({
+      type: "service-acquisition",
+      service: definition.name,
+      generation: record.generation,
+      action,
+    });
 
     await record.ready;
     if (this.#services.get(definition.name) !== record) {
@@ -200,7 +211,7 @@ export class DaemonServer {
     return {
       added,
       record,
-      publicRecord: { name: definition.name, generation: record.generation },
+      publicRecord: { name: definition.name, generation: record.generation, action },
     };
   }
 
