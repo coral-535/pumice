@@ -1,5 +1,8 @@
 # Pumice
 
+> [!WARNING]
+> Pumice is currently experimental. Expect breaking changes.
+
 Pumice keeps worktree-scoped development services alive while a finite command
 uses them. One daemon directly owns the service process groups. A
 `ServiceGuard` connection owns the references acquired through it, and closing
