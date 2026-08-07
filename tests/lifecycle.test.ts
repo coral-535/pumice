@@ -64,14 +64,17 @@ test("RunningCommand disposal escalates after its grace period", async () => {
 test("guards share a generation and only the final disposal stops it", async () => {
   await using fixture = await daemonFixture();
   const definition = serviceDefinition(fixture.path, { readyDelay: 80 });
-  const guardOne = await fixture.connect();
-  const guardTwo = await fixture.connect();
+  const output: string[] = [];
+  const guardOne = await fixture.connect({ output: (message) => output.push(message) });
+  const guardTwo = await fixture.connect({ output: (message) => output.push(message) });
 
   const [one, two] = await Promise.all([
     guardOne.run({ services: [definition] }),
     guardTwo.run({ services: [definition] }),
   ]);
   assert.equal(one.services[0].generation, two.services[0].generation);
+  assert.deepEqual([one.services[0].action, two.services[0].action].sort(), ["reused", "started"]);
+  assert.deepEqual(output.sort(), ["Starting database...", "Using existing database service."]);
   assert.equal(fixture.daemon.serviceCount, 1);
 
   await guardOne[Symbol.asyncDispose]();
@@ -98,13 +101,15 @@ test("an active service name rejects a conflicting definition", async () => {
 
 test("startup failure stops the partial service and rejects acquisition", async () => {
   await using fixture = await daemonFixture();
-  await using guard = await fixture.connect();
+  const output: string[] = [];
+  await using guard = await fixture.connect({ output: (message) => output.push(message) });
   const definition = serviceDefinition(fixture.path, {
     readyDelay: 10_000,
     healthcheckTimeout: 150,
   });
 
   await assert.rejects(guard.run([definition]), ServiceStartupError);
+  assert.deepEqual(output, ["Starting database..."]);
   await waitForFile(definition.stoppedPath);
   assert.equal(fixture.daemon.serviceCount, 0);
 });
@@ -245,7 +250,8 @@ async function daemonFixture() {
     path: temporary.path,
     daemon,
     connectionOptions,
-    connect: () => ServiceGuard.connect(temporary.path, connectionOptions),
+    connect: (options: ServiceGuardOptions = {}) =>
+      ServiceGuard.connect(temporary.path, { ...connectionOptions, ...options }),
     async [Symbol.asyncDispose]() {
       await daemon.close();
       await temporary[Symbol.asyncDispose]();
